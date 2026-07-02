@@ -1,0 +1,73 @@
+stacks:
+- name: hss
+  request-timeout: 120
+  connection-request-timeout: 40
+  cer-timeout: 30
+  dpr-timeout: 30
+  dwr-timeout: 30
+  realm: test.com
+  host: host1
+  command-files:
+  - commands.yaml
+  alarm-management:
+    alarm-manager-url: "http://localhost:8088/alarms"
+    key-file: "certs/server.key"
+    cert-file: "certs/server.crt"
+    ca-cert-file: "certs/ca.crt"
+    alarm-db:
+      path: "alarms-1.db"
+    alarm-rest-path: "/alarms"
+  listen:
+  - address: "tcp://127.0.0.1:3868?tls=true"
+    cert-file: "certs/server.crt"
+    key-file: "certs/server.key"
+    ca-cert-file: "certs/ca.crt"
+  - address: "sctp://127.0.0.2:3868?tls=true"
+    cert-file: "certs/server.crt"
+    key-file: "certs/server.key"
+    ca-cert-file: "certs/ca.crt"
+  my-request-processors:
+  - command-codes:
+    - 306
+    application-ids:
+    - 16777216
+    urls:
+    - "http://localhost:8080/diameter"
+  peers:
+  - host: test@example.com
+    connection-url: "RoundRobin(tcp://127.0.0.1:3868?tls=true&autoReconnect=true&autoReconnectInterval=10;FailOver(sctp://127.0.0.1,127.0.0.2:3868?tls=true&autoReconnect=true&autoReconnectInterval=10))"
+    cert-file: "certs/client.crt"
+    key-file: "certs/client.key"
+    ca-cert-file: "certs/ca.crt"
+  routing:
+    policy: "REALM"
+    default: RoundRobin(node1.test.com@test.com;FailOver(node2.test.com@test.com;test.com@test.com))
+    items:
+    - host-realms:
+      - test.com
+      application-ids:
+      - 16777216
+      - 16777217
+      route: FailOver(node1.test.com@test.com;RoundRobin(node2.test.com@test.com;test.com@test.com))
+  capability:
+    vendor-id: 10415
+    product-name: "HSS Diameter Stack"
+    host-ips:
+    - 127.0.0.1
+    - 10.0.0.1
+    supported-vendor-ids:
+      - 10415
+    auth-application-ids:
+      - 16777216
+    acct-application-ids:
+      - 16777216
+    in-band-security-ids:
+      - 0
+      - 1
+    vendor-specific:
+      - vendor-ids: 10415
+        auth-application-id: 16777216
+        acct-application-id: 16777216
+      - vendor-ids: 10415
+        auth-application-id: 16777217
+        acct-application-id: 16777217
