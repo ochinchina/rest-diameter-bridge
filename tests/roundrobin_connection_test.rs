@@ -18,7 +18,10 @@ async fn test_round_robin_connection() {
         "test".to_string(),
         "example.com".to_string(),
     )) as Box<dyn Connection + Send + Sync>);
-    let round_robin =
-        rest_diameter_bridge::transport::RoundRobinConnection::new(vec![connection1, connection2]);
+    let round_robin = rest_diameter_bridge::transport::RoundRobinConnection::new(
+        "test".to_string(),
+        "example.com".to_string(),
+        vec![connection1, connection2],
+    );
     round_robin.send(&command).await.unwrap()
 }

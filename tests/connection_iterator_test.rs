@@ -14,6 +14,22 @@ fn make_conn(id: &str) -> Arc<Box<dyn Connection + Send + Sync>> {
     )) as Box<dyn Connection + Send + Sync>)
 }
 
+fn rr(connections: Vec<Arc<Box<dyn Connection + Send + Sync>>>) -> RoundRobinConnection {
+    RoundRobinConnection::new(
+        "test-peer-host".to_string(),
+        "test-peer-realm".to_string(),
+        connections,
+    )
+}
+
+fn fo(connections: Vec<Arc<Box<dyn Connection + Send + Sync>>>) -> FailOverConnection {
+    FailOverConnection::new(
+        "test-peer-host".to_string(),
+        "test-peer-realm".to_string(),
+        connections,
+    )
+}
+
 // === Round-Robin Iterator Tests ===
 
 #[tokio::test]
@@ -77,7 +93,7 @@ async fn test_roundrobin_iterator_empty_list() {
 
 #[tokio::test]
 async fn test_roundrobin_connection_iter_advances_index() {
-    let rr = RoundRobinConnection::new(vec![make_conn("rr1"), make_conn("rr2"), make_conn("rr3")]);
+    let rr = rr(vec![make_conn("rr1"), make_conn("rr2"), make_conn("rr3")]);
 
     // First iter call
     let ids1: Vec<String> = rr.iter().unwrap().map(|c| c.get_id()).collect();
@@ -119,8 +135,7 @@ async fn test_multiple_sequential_iterations_are_independent() {
 
 #[tokio::test]
 async fn test_failover_iterator_always_starts_at_zero() {
-    let failover =
-        FailOverConnection::new(vec![make_conn("fo1"), make_conn("fo2"), make_conn("fo3")]);
+    let failover = fo(vec![make_conn("fo1"), make_conn("fo2"), make_conn("fo3")]);
 
     let ids: Vec<String> = failover.iter().unwrap().map(|c| c.get_id()).collect();
     assert_eq!(ids, vec!["fo1", "fo2", "fo3"]);
@@ -132,7 +147,7 @@ async fn test_failover_iterator_always_starts_at_zero() {
 
 #[tokio::test]
 async fn test_failover_iterator_single_connection() {
-    let failover = FailOverConnection::new(vec![make_conn("primary")]);
+    let failover = fo(vec![make_conn("primary")]);
 
     let ids: Vec<String> = failover.iter().unwrap().map(|c| c.get_id()).collect();
     assert_eq!(ids, vec!["primary"]);
@@ -166,16 +181,16 @@ async fn test_failover_iterator_count_matches_connection_count() {
 #[tokio::test]
 async fn test_hybrid_roundrobin_containing_failover_groups() {
     // RoundRobin [ FailOver[a1, a2], FailOver[b1, b2] ]
-    let failover_a = Arc::new(Box::new(FailOverConnection::new(vec![
+    let failover_a = Arc::new(Box::new(fo(vec![
         make_conn("a1"),
         make_conn("a2"),
     ])) as Box<dyn Connection + Send + Sync>);
-    let failover_b = Arc::new(Box::new(FailOverConnection::new(vec![
+    let failover_b = Arc::new(Box::new(fo(vec![
         make_conn("b1"),
         make_conn("b2"),
     ])) as Box<dyn Connection + Send + Sync>);
 
-    let rr = RoundRobinConnection::new(vec![failover_a, failover_b]);
+    let rr = rr(vec![failover_a, failover_b]);
 
     let ids: Vec<String> = rr.iter().unwrap().map(|c| c.get_id()).collect();
 
@@ -186,16 +201,16 @@ async fn test_hybrid_roundrobin_containing_failover_groups() {
 #[tokio::test]
 async fn test_hybrid_roundrobin_containing_failover_groups_offset() {
     // RoundRobin [ FailOver[a1, a2], FailOver[b1, b2] ]
-    let failover_a = Arc::new(Box::new(FailOverConnection::new(vec![
+    let failover_a = Arc::new(Box::new(fo(vec![
         make_conn("a1"),
         make_conn("a2"),
     ])) as Box<dyn Connection + Send + Sync>);
-    let failover_b = Arc::new(Box::new(FailOverConnection::new(vec![
+    let failover_b = Arc::new(Box::new(fo(vec![
         make_conn("b1"),
         make_conn("b2"),
     ])) as Box<dyn Connection + Send + Sync>);
 
-    let rr = RoundRobinConnection::new(vec![failover_a, failover_b]);
+    let rr = rr(vec![failover_a, failover_b]);
 
     // Advance the index by consuming the first iterator
     let _ = rr.iter().unwrap().count();
@@ -208,16 +223,16 @@ async fn test_hybrid_roundrobin_containing_failover_groups_offset() {
 #[tokio::test]
 async fn test_hybrid_failover_containing_roundrobin_groups() {
     // FailOver [ RoundRobin[a1, a2], RoundRobin[b1, b2] ]
-    let rr_a = Arc::new(Box::new(RoundRobinConnection::new(vec![
+    let rr_a = Arc::new(Box::new(rr(vec![
         make_conn("a1"),
         make_conn("a2"),
     ])) as Box<dyn Connection + Send + Sync>);
-    let rr_b = Arc::new(Box::new(RoundRobinConnection::new(vec![
+    let rr_b = Arc::new(Box::new(rr(vec![
         make_conn("b1"),
         make_conn("b2"),
     ])) as Box<dyn Connection + Send + Sync>);
 
-    let failover = FailOverConnection::new(vec![rr_a, rr_b]);
+    let failover = fo(vec![rr_a, rr_b]);
 
     let ids: Vec<String> = failover.iter().unwrap().map(|c| c.get_id()).collect();
 
@@ -232,12 +247,12 @@ async fn test_hybrid_failover_containing_roundrobin_groups() {
 #[tokio::test]
 async fn test_hybrid_roundrobin_mixed_plain_and_failover() {
     // RoundRobin [ plain, FailOver[fo1, fo2] ]
-    let failover = Arc::new(Box::new(FailOverConnection::new(vec![
+    let failover = Arc::new(Box::new(fo(vec![
         make_conn("fo1"),
         make_conn("fo2"),
     ])) as Box<dyn Connection + Send + Sync>);
 
-    let rr = RoundRobinConnection::new(vec![make_conn("plain"), failover]);
+    let rr = rr(vec![make_conn("plain"), failover]);
 
     let ids: Vec<String> = rr.iter().unwrap().map(|c| c.get_id()).collect();
 
@@ -250,12 +265,12 @@ async fn test_hybrid_roundrobin_mixed_plain_and_failover() {
 #[tokio::test]
 async fn test_hybrid_failover_mixed_plain_and_roundrobin() {
     // FailOver [ plain, RoundRobin[rr1, rr2] ]
-    let roundrobin = Arc::new(Box::new(RoundRobinConnection::new(vec![
+    let roundrobin = Arc::new(Box::new(rr(vec![
         make_conn("rr1"),
         make_conn("rr2"),
     ])) as Box<dyn Connection + Send + Sync>);
 
-    let failover = FailOverConnection::new(vec![make_conn("plain"), roundrobin]);
+    let failover = fo(vec![make_conn("plain"), roundrobin]);
 
     let ids: Vec<String> = failover.iter().unwrap().map(|c| c.get_id()).collect();
 
@@ -268,16 +283,16 @@ async fn test_hybrid_failover_mixed_plain_and_roundrobin() {
 #[tokio::test]
 async fn test_hybrid_deeply_nested() {
     // RoundRobin [ FailOver [ RoundRobin[a, b], c ] ]
-    let inner_rr = Arc::new(Box::new(RoundRobinConnection::new(vec![
+    let inner_rr = Arc::new(Box::new(rr(vec![
         make_conn("a"),
         make_conn("b"),
     ])) as Box<dyn Connection + Send + Sync>);
     let failover = Arc::new(
-        Box::new(FailOverConnection::new(vec![inner_rr, make_conn("c")]))
+        Box::new(fo(vec![inner_rr, make_conn("c")]))
             as Box<dyn Connection + Send + Sync>,
     );
 
-    let outer_rr = RoundRobinConnection::new(vec![failover]);
+    let outer_rr = rr(vec![failover]);
 
     let ids: Vec<String> = outer_rr.iter().unwrap().map(|c| c.get_id()).collect();
 
@@ -291,12 +306,12 @@ async fn test_hybrid_deeply_nested() {
 #[tokio::test]
 async fn test_hybrid_failover_first_then_plain() {
     // RoundRobin [ FailOver[fo1, fo2], plain ]
-    let failover = Arc::new(Box::new(FailOverConnection::new(vec![
+    let failover = Arc::new(Box::new(fo(vec![
         make_conn("fo1"),
         make_conn("fo2"),
     ])) as Box<dyn Connection + Send + Sync>);
 
-    let rr = RoundRobinConnection::new(vec![failover, make_conn("plain")]);
+    let rr = rr(vec![failover, make_conn("plain")]);
 
     let ids: Vec<String> = rr.iter().unwrap().map(|c| c.get_id()).collect();
 
@@ -311,13 +326,13 @@ async fn test_hybrid_failover_first_then_plain() {
 async fn test_hybrid_roundrobin_with_empty_failover() {
     // RoundRobin [ FailOver[], plain, FailOver[fo1, fo2] ]
     let empty_failover =
-        Arc::new(Box::new(FailOverConnection::new(vec![])) as Box<dyn Connection + Send + Sync>);
-    let failover = Arc::new(Box::new(FailOverConnection::new(vec![
+        Arc::new(Box::new(fo(vec![])) as Box<dyn Connection + Send + Sync>);
+    let failover = Arc::new(Box::new(fo(vec![
         make_conn("fo1"),
         make_conn("fo2"),
     ])) as Box<dyn Connection + Send + Sync>);
 
-    let rr = RoundRobinConnection::new(vec![empty_failover, make_conn("plain"), failover]);
+    let rr = rr(vec![empty_failover, make_conn("plain"), failover]);
 
     let ids: Vec<String> = rr.iter().unwrap().map(|c| c.get_id()).collect();
 
@@ -332,13 +347,13 @@ async fn test_hybrid_roundrobin_with_empty_failover() {
 async fn test_hybrid_failover_with_empty_roundrobin() {
     // FailOver [ RoundRobin[], plain, RoundRobin[rr1, rr2] ]
     let empty_rr =
-        Arc::new(Box::new(RoundRobinConnection::new(vec![])) as Box<dyn Connection + Send + Sync>);
-    let rr = Arc::new(Box::new(RoundRobinConnection::new(vec![
+        Arc::new(Box::new(rr(vec![])) as Box<dyn Connection + Send + Sync>);
+    let rr = Arc::new(Box::new(rr(vec![
         make_conn("rr1"),
         make_conn("rr2"),
     ])) as Box<dyn Connection + Send + Sync>);
 
-    let failover = FailOverConnection::new(vec![empty_rr, make_conn("plain"), rr]);
+    let failover = fo(vec![empty_rr, make_conn("plain"), rr]);
 
     let ids: Vec<String> = failover.iter().unwrap().map(|c| c.get_id()).collect();
 
@@ -353,11 +368,11 @@ async fn test_hybrid_failover_with_empty_roundrobin() {
 async fn test_hybrid_roundrobin_all_empty_containers() {
     // RoundRobin [ FailOver[], RoundRobin[] ]
     let empty_failover =
-        Arc::new(Box::new(FailOverConnection::new(vec![])) as Box<dyn Connection + Send + Sync>);
+        Arc::new(Box::new(fo(vec![])) as Box<dyn Connection + Send + Sync>);
     let empty_rr =
-        Arc::new(Box::new(RoundRobinConnection::new(vec![])) as Box<dyn Connection + Send + Sync>);
+        Arc::new(Box::new(rr(vec![])) as Box<dyn Connection + Send + Sync>);
 
-    let rr = RoundRobinConnection::new(vec![empty_failover, empty_rr]);
+    let rr = rr(vec![empty_failover, empty_rr]);
 
     let ids: Vec<String> = rr.iter().unwrap().map(|c| c.get_id()).collect();
 
@@ -368,11 +383,11 @@ async fn test_hybrid_roundrobin_all_empty_containers() {
 async fn test_hybrid_failover_all_empty_containers() {
     // FailOver [ RoundRobin[], FailOver[] ]
     let empty_rr =
-        Arc::new(Box::new(RoundRobinConnection::new(vec![])) as Box<dyn Connection + Send + Sync>);
+        Arc::new(Box::new(rr(vec![])) as Box<dyn Connection + Send + Sync>);
     let empty_failover =
-        Arc::new(Box::new(FailOverConnection::new(vec![])) as Box<dyn Connection + Send + Sync>);
+        Arc::new(Box::new(fo(vec![])) as Box<dyn Connection + Send + Sync>);
 
-    let failover = FailOverConnection::new(vec![empty_rr, empty_failover]);
+    let failover = fo(vec![empty_rr, empty_failover]);
 
     assert!(failover.iter().is_some()); // Should return Some iterator, even if empty
     assert!(failover.iter().unwrap().next().is_none()); // Iterator should yield no connections
@@ -382,17 +397,17 @@ async fn test_hybrid_failover_all_empty_containers() {
 async fn test_hybrid_mixed_empty_and_populated_nested() {
     // RoundRobin [ FailOver[], FailOver[fo1], RoundRobin[], plain, FailOver[fo2, fo3] ]
     let empty_fo =
-        Arc::new(Box::new(FailOverConnection::new(vec![])) as Box<dyn Connection + Send + Sync>);
-    let fo_single = Arc::new(Box::new(FailOverConnection::new(vec![make_conn("fo1")]))
+        Arc::new(Box::new(fo(vec![])) as Box<dyn Connection + Send + Sync>);
+    let fo_single = Arc::new(Box::new(fo(vec![make_conn("fo1")]))
         as Box<dyn Connection + Send + Sync>);
     let empty_rr =
-        Arc::new(Box::new(RoundRobinConnection::new(vec![])) as Box<dyn Connection + Send + Sync>);
-    let fo_double = Arc::new(Box::new(FailOverConnection::new(vec![
+        Arc::new(Box::new(rr(vec![])) as Box<dyn Connection + Send + Sync>);
+    let fo_double = Arc::new(Box::new(fo(vec![
         make_conn("fo2"),
         make_conn("fo3"),
     ])) as Box<dyn Connection + Send + Sync>);
 
-    let rr = RoundRobinConnection::new(vec![
+    let rr = rr(vec![
         empty_fo,
         fo_single,
         empty_rr,

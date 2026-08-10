@@ -3,8 +3,10 @@ use log::{error, info};
 use rusqlite::{Connection as SqliteConnection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
+/// The severity level of a Diameter peer alarm.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum AlarmSeverity {
@@ -15,6 +17,7 @@ pub enum AlarmSeverity {
     Clear,
 }
 
+/// Represents a Diameter peer connectivity alarm with full identity and timing information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Alarm {
     pub alarm_id: String,
@@ -27,6 +30,14 @@ pub struct Alarm {
 }
 
 impl Alarm {
+    /// Creates a new `Alarm`.
+    ///
+    /// # Arguments
+    /// * `peer_address` - The network address of the remote Diameter peer.
+    /// * `diameter_host` - The Diameter identity (Origin-Host) of the peer.
+    /// * `diameter_realm` - The Diameter realm of the peer.
+    /// * `severity` - The alarm severity level.
+    /// * `description` - A human-readable description of the alarm condition.
     pub fn new(
         peer_address: &str,
         diameter_host: &str,
@@ -54,6 +65,15 @@ pub struct AlarmStore {
 }
 
 impl AlarmStore {
+    /// Opens (or creates) the SQLite alarm database at `db_path`, creates the required tables
+    /// if they do not exist, and loads any previously persisted active alarms into memory.
+    ///
+    /// # Arguments
+    /// * `db_path` - Filesystem path to the SQLite database file.
+    ///
+    /// # Returns
+    /// * `Ok(AlarmStore)` on success.
+    /// * `Err(String)` if the database cannot be opened or initialised.
     pub fn new(db_path: &str) -> Result<Self, String> {
         let conn = SqliteConnection::open(db_path)
             .map_err(|e| format!("Failed to open alarm database at {}: {}", db_path, e))?;
@@ -131,11 +151,14 @@ impl AlarmStore {
         })
     }
 
-    pub fn raise(&self, alarm: Alarm) {
+    /// Persists the alarm to the database and records it in the active alarm set.
+    pub async fn raise(&self, alarm: Alarm) {
         let alarm_id = alarm.alarm_id.clone();
+        {
+            let db = self.db.lock().await;
 
-        // Insert into DB
-        if let Ok(db) = self.db.lock() {
+            // Insert into DB
+
             if let Err(e) = db.execute(
                 "INSERT OR REPLACE INTO active_alarms (alarm_id, severity, peer_address, diameter_host, diameter_realm, description, raised_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
@@ -167,16 +190,20 @@ impl AlarmStore {
         }
 
         // Insert into memory
-        if let Ok(mut alarms) = self.active_alarms.lock() {
+        {
+            let mut alarms = self.active_alarms.lock().await;
             alarms.insert(alarm_id.clone(), alarm);
         }
 
         info!("Alarm raised: {}", alarm_id);
     }
 
-    pub fn clear(&self, alarm_id: &str) {
+    /// Removes the alarm identified by `alarm_id` from the active set and records a clear event.
+    pub async fn clear(&self, alarm_id: &str) {
+        let db = self.db.lock().await;
+
         // Remove from DB
-        if let Ok(db) = self.db.lock() {
+        {
             if let Err(e) = db.execute(
                 "DELETE FROM active_alarms WHERE alarm_id = ?1",
                 params![alarm_id],
@@ -192,32 +219,25 @@ impl AlarmStore {
         }
 
         // Remove from memory
-        if let Ok(mut alarms) = self.active_alarms.lock() {
+        {
+            let mut alarms = self.active_alarms.lock().await;
             alarms.remove(alarm_id);
         }
 
         info!("Alarm cleared: {}", alarm_id);
     }
 
-    pub fn get_active_alarms(&self) -> Vec<Alarm> {
-        self.active_alarms
-            .lock()
-            .map(|alarms| alarms.values().cloned().collect())
-            .unwrap_or_default()
+    pub async fn get_active_alarms(&self) -> Vec<Alarm> {
+        self.active_alarms.lock().await.values().cloned().collect()
     }
 
-    pub fn get_alarm(&self, alarm_id: &str) -> Option<Alarm> {
-        self.active_alarms
-            .lock()
-            .ok()
-            .and_then(|alarms| alarms.get(alarm_id).cloned())
+    pub async fn get_alarm(&self, alarm_id: &str) -> Option<Alarm> {
+        self.active_alarms.lock().await.get(alarm_id).cloned()
     }
 
-    pub fn is_active(&self, alarm_id: &str) -> bool {
-        self.active_alarms
-            .lock()
-            .map(|alarms| alarms.contains_key(alarm_id))
-            .unwrap_or(false)
+    /// Returns `true` if an alarm with the given ID is currently active.
+    pub async fn is_active(&self, alarm_id: &str) -> bool {
+        self.active_alarms.lock().await.contains_key(alarm_id)
     }
 }
 
@@ -230,6 +250,14 @@ pub struct AlarmSender {
 }
 
 impl AlarmSender {
+    /// Creates a new `AlarmSender`.
+    ///
+    /// # Arguments
+    /// * `url` - Optional URL of the remote alarm manager endpoint; if `None` alarms are only stored locally.
+    /// * `store` - The [`AlarmStore`] used for persistence and in-memory tracking.
+    /// * `cert_file` - Optional path to a PEM client certificate for mTLS.
+    /// * `key_file` - Optional path to the corresponding private key file.
+    /// * `ca_cert_file` - Optional path to a PEM CA certificate for server verification.
     pub fn new(
         url: Option<String>,
         store: AlarmStore,
@@ -293,10 +321,12 @@ impl AlarmSender {
             .map_err(|e| format!("Failed to build reqwest client: {}", e))
     }
 
+    /// Returns a reference to the underlying [`AlarmStore`].
     pub fn get_store(&self) -> &AlarmStore {
         &self.store
     }
 
+    /// Raises a Major-severity alarm for the given peer and forwards it to the remote alarm manager.
     pub async fn raise_alarm(
         &self,
         peer_address: &str,
@@ -311,10 +341,11 @@ impl AlarmSender {
             AlarmSeverity::Major,
             description,
         );
-        self.store.raise(alarm.clone());
+        self.store.raise(alarm.clone()).await;
         self.send_alarm(&alarm).await;
     }
 
+    /// Clears the alarm for the given peer and forwards a Clear event to the remote alarm manager.
     pub async fn clear_alarm(&self, peer_address: &str, diameter_host: &str, diameter_realm: &str) {
         let alarm = Alarm::new(
             peer_address,
@@ -323,7 +354,7 @@ impl AlarmSender {
             AlarmSeverity::Clear,
             "Connection to diameter peer established",
         );
-        self.store.clear(&alarm.alarm_id);
+        self.store.clear(&alarm.alarm_id).await;
         self.send_alarm(&alarm).await;
     }
 

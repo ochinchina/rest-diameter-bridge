@@ -1,19 +1,27 @@
 use crate::command::Command;
-use crate::transport::{Connection, ConnectionIterator, ConnectionList};
+use crate::transport::Connection;
+use crate::transport::connection_list::{ConnectionIterator, ConnectionList};
 use log::error;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
+/// A [`Connection`] that sends to the first available peer in a list, trying
+/// subsequent peers only when the current one fails.
 pub struct FailOverConnection {
     id: String,
+    peer_host: String,
+    peer_realm: String,
     connections: Arc<ConnectionList>,
     index: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FailOverConnection {
-    pub fn new(connections: Vec<Arc<Box<dyn Connection + Send + Sync>>>) -> Self {
+    /// Creates a new `FailOverConnection` wrapping the given list of underlying connections.
+    pub fn new(peer_host: String, peer_realm: String, connections: Vec<Arc<Box<dyn Connection + Send + Sync>>>) -> Self {
         FailOverConnection {
             id: "failover-".to_owned() + &uuid::Uuid::new_v4().to_string(),
+            peer_host,
+            peer_realm,
             connections: Arc::new(ConnectionList::new(connections)),
             index: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -84,12 +92,25 @@ impl Connection for FailOverConnection {
         true
     }
 
+    async fn get_connections(&self, connections: &mut Vec<Arc<Box<dyn Connection + Send + Sync>>>) {
+        let conn_list = self.connections.get_connections().await;
+        let n = conn_list.len();
+        if n > 0 {
+            let index = self.index.load(std::sync::atomic::Ordering::Relaxed);
+            for i in 0..n {
+                let idx = (index + i) % n;
+                connections.push(conn_list[idx].clone());
+            }
+        }
+    }
+
     fn iter(
         &self,
     ) -> Option<Box<dyn Iterator<Item = Arc<Box<dyn Connection + Send + Sync>>> + Send>> {
         if self.connections.len() == 0 {
             return None;
         }
+
         Some(Box::new(ConnectionIterator::new(
             self.connections.clone(),
             AtomicUsize::new(0),
@@ -101,10 +122,10 @@ impl Connection for FailOverConnection {
     }
 
     fn get_peer_host(&self) -> Result<String, String> {
-        Ok("failover".to_string())
+        Ok(self.peer_host.clone())
     }
 
     fn get_peer_realm(&self) -> Result<String, String> {
-        Ok("failover".to_string())
+        Ok(self.peer_realm.clone())
     }
 }

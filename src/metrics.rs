@@ -30,6 +30,8 @@ lazy_static! {
     .unwrap();
 }
 
+/// Registers all Diameter metric counters with the global [`REGISTRY`].
+/// Must be called once at startup before any metrics are incremented.
 pub fn register_metrics() {
     REGISTRY
         .register(Box::new(REQUESTS_RECEIVED.clone()))
@@ -48,6 +50,7 @@ pub fn register_metrics() {
         .unwrap();
 }
 
+/// Collects all registered metrics and returns them in the Prometheus text exposition format.
 pub fn gather_metrics() -> String {
     let encoder = TextEncoder::new();
     let metric_families = REGISTRY.gather();

@@ -1,23 +1,27 @@
 use crate::command::Command;
-use crate::transport::{Connection, ConnectionIterator, ConnectionList};
+use crate::transport::Connection;
+use crate::transport::connection_list::{ConnectionIterator, ConnectionList};
 use log::{error, info};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
+/// A [`Connection`] that distributes successive send operations across its child connections
+/// in round-robin order, failing over to the next peer on error.
 pub struct RoundRobinConnection {
     id: String,
-    host: String,
-    realm: String,
+    peer_host: String,
+    peer_realm: String,
     connections: Arc<ConnectionList>,
     index: Arc<AtomicUsize>,
 }
 
 impl RoundRobinConnection {
-    pub fn new(connections: Vec<Arc<Box<dyn Connection + Send + Sync>>>) -> Self {
+    /// Creates a new `RoundRobinConnection` wrapping the given list of underlying connections.
+    pub fn new(peer_host: String, peer_realm: String, connections: Vec<Arc<Box<dyn Connection + Send + Sync>>>) -> Self {
         RoundRobinConnection {
             id: "round_robin-".to_owned() + &uuid::Uuid::new_v4().to_string(),
-            host: "round_robin-host".to_string() + uuid::Uuid::new_v4().to_string().as_str(),
-            realm: "round_robin-realm".to_string() + uuid::Uuid::new_v4().to_string().as_str(),
+            peer_host,
+            peer_realm,
             connections: Arc::new(ConnectionList::new(connections)),
 
             index: Arc::new(AtomicUsize::new(0)),
@@ -91,6 +95,18 @@ impl Connection for RoundRobinConnection {
         true
     }
 
+    async fn get_connections(&self, connections: &mut Vec<Arc<Box<dyn Connection + Send + Sync>>>) {
+        let conn_list = self.connections.get_connections().await;
+        let n = self.connections.len();
+        let index = self.index.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n > 0 {
+            for i in 0..n {
+                let idx = (index + i) % n;
+                connections.push(conn_list[idx].clone());
+            }
+        }
+    }
+
     fn iter(
         &self,
     ) -> Option<Box<dyn Iterator<Item = Arc<Box<dyn Connection + Send + Sync>>> + Send>> {
@@ -110,10 +126,10 @@ impl Connection for RoundRobinConnection {
     }
 
     fn get_peer_host(&self) -> Result<String, String> {
-        Ok(self.host.clone())
+        Ok(self.peer_host.clone())
     }
 
     fn get_peer_realm(&self) -> Result<String, String> {
-        Ok(self.realm.clone())
+        Ok(self.peer_realm.clone())
     }
 }

@@ -1,10 +1,13 @@
 use crate::command::Command;
-use crate::transport::{Connection, ConnectionIterator, ConnectionList};
+use crate::transport::Connection;
+use crate::transport::connection_list::{ConnectionIterator, ConnectionList};
 use log::error;
 use rand::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
+/// A [`Connection`] that selects a random starting peer for each send operation and
+/// tries subsequent peers in order on failure.
 pub struct RandomConnection {
     id: String,
     host: String,
@@ -13,6 +16,7 @@ pub struct RandomConnection {
 }
 
 impl RandomConnection {
+    /// Creates a new `RandomConnection` wrapping the given list of underlying connections.
     pub fn new(connections: Vec<Arc<Box<dyn Connection + Send + Sync>>>) -> Self {
         RandomConnection {
             id: "random-".to_owned() + &uuid::Uuid::new_v4().to_string(),
@@ -77,6 +81,18 @@ impl Connection for RandomConnection {
             }
         }
         true
+    }
+
+    async fn get_connections(&self, connections: &mut Vec<Arc<Box<dyn Connection + Send + Sync>>>) {
+        let conn_list = self.connections.get_connections().await;
+        let n = conn_list.len();
+        if n > 0 {
+            let index = rand::rng().random_range(0..n);
+            for i in 0..n {
+                let idx = (index + i) % n;
+                connections.push(conn_list[idx].clone());
+            }
+        }
     }
 
     fn iter(

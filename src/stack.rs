@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::{error, info};
-use tokio::sync::Mutex;
 
 use crate::alarm::{AlarmSender, AlarmStore};
 use crate::avp::AvpMap;
@@ -12,10 +11,12 @@ use crate::avp::load_avp_definition_from_yaml_files;
 use crate::command::{CommandMap, load_command_definition_from_yaml_files};
 use crate::config::StackConfig;
 use crate::http_rest_listener::HttpRestListener;
-use crate::transport::DefaultCommandHandler;
+use crate::transport::{AnswerManager, DefaultCommandHandler, RedirectHostManager, answer_manager};
 use crate::transport::HopByHopIdMapper;
 use crate::transport::RequestProcessor;
 use crate::transport::RoutingConnectionManager;
+#[cfg(target_os = "linux")]
+use crate::transport::sctp_transport::{SctpClientConnection, SctpDiameterServer};
 use crate::transport::{
     Connection, ConnectionManager, FailOverConnection,
     IdGenerator, RandomConnection, RoundRobinConnection, TcpClientConnection, TcpDiameterServer,
@@ -204,26 +205,31 @@ impl ListenAddress {
 pub struct DiameterStack {
     config: StackConfig,
     // Fields for the Diameter stack
-    connection_manager: Arc<Mutex<ConnectionManager>>,
-    hop_by_hop_id_generator: Arc<IdGenerator>,
-    end_to_end_id_generator: Arc<IdGenerator>,
-    hop_by_hop_id_mapper: Arc<HopByHopIdMapper>,
+    connection_manager: Arc<Box<ConnectionManager>>,
+    hop_by_hop_id_generator: Arc<Box<IdGenerator>>,
+    end_to_end_id_generator: Arc<Box<IdGenerator>>,
+    hop_by_hop_id_mapper: Arc<Box<HopByHopIdMapper>>,
+    answer_manager: Arc<Box<AnswerManager>>,
     alarm_sender: Option<AlarmSender>,
     alarm_store: Option<AlarmStore>,
+    redirect_host_manager: Arc<Box<RedirectHostManager>>,
+
 }
 
 impl DiameterStack {
     pub fn new(config: StackConfig) -> Self {
         let routing_manager = if config.routing.is_some() {
-            Some(RoutingConnectionManager::new(config.routing.clone().unwrap()))
+            Some(RoutingConnectionManager::new(&config.routing.clone().unwrap()))
         } else {
             None
         };
-        let hop_by_hop_id_generator = Arc::new(IdGenerator::new());
+        let hop_by_hop_id_generator = Arc::new(Box::new(IdGenerator::new()));
         let per_conn_timeout = config.connection_request_timeout.map_or(Duration::from_millis(60 * 1000), |t| Duration::from_millis(t));
         let total_timeout = config.request_timeout.map_or(Duration::from_millis(10 * 1000), |t| Duration::from_millis(t));
-        let hop_by_hop_id_mapper = Arc::new(HopByHopIdMapper::new(hop_by_hop_id_generator.clone()));
-        let conn_manager = ConnectionManager::new(per_conn_timeout, total_timeout, routing_manager.clone(), hop_by_hop_id_mapper.clone(), config.request_retry_result_codes.clone().unwrap_or_default());
+        let redirect_host_manager = Arc::new(Box::new(RedirectHostManager::new()));
+        let hop_by_hop_id_mapper = Arc::new(Box::new(HopByHopIdMapper::new()));
+        let answer_manager = Arc::new(Box::new(answer_manager::AnswerManager::new()));
+        let conn_manager = ConnectionManager::new(per_conn_timeout, total_timeout, routing_manager.clone(), answer_manager.clone(), config.request_retry_result_codes.clone().unwrap_or_default(), redirect_host_manager.clone());
 
         // Initialize alarm store and sender
         let db_path = config
@@ -257,12 +263,14 @@ impl DiameterStack {
 
         DiameterStack {
             config,
-            connection_manager: Arc::new(Mutex::new(conn_manager)),
+            connection_manager: Arc::new(Box::new(conn_manager)),
             hop_by_hop_id_generator: hop_by_hop_id_generator.clone(),
-            end_to_end_id_generator: Arc::new(IdGenerator::new()),
+            end_to_end_id_generator: Arc::new(Box::new(IdGenerator::new())),
             hop_by_hop_id_mapper: hop_by_hop_id_mapper.clone(),
+            answer_manager,
             alarm_sender,
-            alarm_store,
+            alarm_store,       
+            redirect_host_manager: redirect_host_manager.clone(),     
         }
     }
 
@@ -306,7 +314,7 @@ impl DiameterStack {
         let command_handler = Arc::new(handler);
 
         self.start_listeners(&command_map, &avp_map, &command_handler);
-        self.start_rest_listeners(&command_map, &avp_map, &command_handler);
+        self.start_rest_listeners(&command_map, &avp_map);
         self.connect_to_peers(&avp_map, &command_map, &command_handler).await;
     }
 
@@ -338,34 +346,28 @@ impl DiameterStack {
                 if listen_address.protocol.to_lowercase() == "tcp" {
                     listen_address.hosts.iter().for_each(|host| {
                         let address = format!("{}:{}", host, listen_address.port);
-                        let connection_manager = connection_manager.clone();
-                        let command_map_clone: CommandMap = command_map.clone();
-                        let avp_map_clone = avp_map.clone();
-                        let dia_host = self.config.host.clone();
-                        let dia_realm = self.config.realm.clone();
-                        let key_file = listener.key_file.clone().unwrap_or_default();
-                        let cert_file = listener.cert_file.clone().unwrap_or_default();
-                        let ca_cert_file = listener.ca_cert_file.clone().unwrap_or_default();
-                        let capability = self.config.capability.clone();
-                        let hop_by_hop_id_mapper = self.hop_by_hop_id_mapper.clone();
-                        let command_handler = command_handler.clone();
-                        let alarm_sender = self.alarm_sender.clone();
-                        tokio::spawn(async move {
-                            let server = TcpDiameterServer::new(
-                                dia_host,
-                                dia_realm,
-                                capability,
-                                key_file,
-                                cert_file,
-                                ca_cert_file,
+                                                
+                        let server = TcpDiameterServer::new(
+                                self.config.host.clone(),
+                                self.config.realm.clone(),
+                                self.config.capability.clone(),
+                                listener.key_file.clone().unwrap_or_default(),
+                                listener.cert_file.clone().unwrap_or_default(),
+                                listener.ca_cert_file.clone().unwrap_or_default(),
                                 address.clone(),
-                                connection_manager,
-                                command_map_clone,
-                                avp_map_clone,
-                                hop_by_hop_id_mapper,
-                                command_handler,
-                                alarm_sender,
+                                connection_manager.clone(),
+                                command_map.clone(),
+                                avp_map.clone(),
+                                self.hop_by_hop_id_generator.clone(),
+                                self.hop_by_hop_id_mapper.clone(),
+                                self.answer_manager.clone(),
+                                command_handler.clone(),
+                                self.alarm_sender.clone(),
+                                self.redirect_host_manager.clone(),
                             );
+
+                        tokio::spawn(async move {
+                            
                             info!("Starting TCP Diameter server on {}", address);
                             if let Err(e) = server.start().await {
                                 error!("TcpDiameterServer error: {}", e);
@@ -373,10 +375,46 @@ impl DiameterStack {
                         });
                     });
                 } else  if listen_address.protocol.to_lowercase() == "sctp" {
-                    info!(
-                        "SCTP protocol is not yet supported for listen address '{}'",
-                        listener.address
-                    );
+                    #[cfg(target_os = "linux")]
+                    {
+                        let addresses: Vec<String> = listen_address.hosts.iter()
+                            .map(|host| format!("{}:{}", host, listen_address.port))
+                            .collect();                        
+                        
+                        let server = SctpDiameterServer::new(
+                                self.config.host.clone(),
+                                self.config.realm.clone(),
+                                self.config.capability.clone(),
+                                listener.key_file.clone().unwrap_or_default(),
+                                listener.cert_file.clone().unwrap_or_default(),
+                                listener.ca_cert_file.clone().unwrap_or_default(),
+                                addresses.clone(),
+                                connection_manager.clone(),
+                                command_map.clone(),
+                                avp_map.clone(),
+                                self.hop_by_hop_id_mapper.clone(),
+                                self.hop_by_hop_id_generator.clone(),    
+                                command_handler.clone(),
+                                self.alarm_sender.clone(),
+                                self.answer_manager.clone(),
+                                self.redirect_host_manager.clone(),
+                            );
+
+                        tokio::spawn(async move {
+                            
+                            info!("Starting SCTP Diameter server on {:?}", addresses);
+                            if let Err(e) = server.start().await {
+                                error!("SctpDiameterServer error: {}", e);
+                            }
+                        });
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        error!(
+                            "SCTP protocol is only supported on Linux for listen address '{}'",
+                            listener.address
+                        );
+                    }
                 } else {
                     error!(
                         "Unsupported protocol in listen address '{}': {}",
@@ -390,7 +428,7 @@ impl DiameterStack {
         }
     }
 
-    fn start_rest_listeners(&self, command_map: &CommandMap, avp_map: &AvpMap, command_handler: &Arc<DefaultCommandHandler>) {
+    fn start_rest_listeners(&self, command_map: &CommandMap, avp_map: &AvpMap) {
         if self.config.rest_listen.is_none() {
             info!("No REST listeners configured for stack '{}'", self.config.name);
             return;
@@ -402,40 +440,26 @@ impl DiameterStack {
             .unwrap_or_else(|| "/alarms".to_string());
 
         for rest_listener in self.config.rest_listen.as_ref().unwrap() {
-            let address = rest_listener.address.clone();
-            let path = rest_listener.path.clone().unwrap_or("/".to_string());
-            let cert_file = rest_listener.cert_file.clone().unwrap_or_default();
-            let key_file = rest_listener.key_file.clone().unwrap_or_default();
-            let ca_cert_file = rest_listener.ca_cert_file.clone().unwrap_or_default();
-            let dia_host = self.config.host.clone();
-            let dia_realm = self.config.realm.clone();
-            let connection_manager = self.connection_manager.clone();
-            let hop_by_hop_id_generator = self.hop_by_hop_id_generator.clone();
-            let end_to_end_id_generator = self.end_to_end_id_generator.clone();
-            let command_handler = command_handler.clone();
-            let command_map = command_map.clone();
-            let avp_map = avp_map.clone();
-            let alarm_store = self.alarm_store.clone();
-            let alarm_rest_path = Some(alarm_rest_path.clone());
+            let http_listener = HttpRestListener::new(
+                    rest_listener.address.clone(),
+                    self.config.host.clone(),
+                    self.config.realm.clone(),
+                    rest_listener.path.clone().unwrap_or("/".to_string()),
+                    rest_listener.cert_file.clone().unwrap_or_default(),
+                    rest_listener.key_file.clone().unwrap_or_default(),
+                    rest_listener.ca_cert_file.clone().unwrap_or_default(),
+                    self.connection_manager.clone(),
+                    avp_map.clone(),
+                    command_map.clone(),
+                    self.hop_by_hop_id_generator.clone(),
+                    self.end_to_end_id_generator.clone(),
+                    self.alarm_store.clone(),
+                    Some(alarm_rest_path.clone()),
+                    self.answer_manager.clone(),
+                );
 
             tokio::spawn(async move {
-                let http_listener = HttpRestListener::new(
-                    address,
-                    dia_host,
-                    dia_realm,
-                    path,
-                    command_handler,
-                    cert_file,
-                    key_file,
-                    ca_cert_file,
-                    connection_manager,
-                    avp_map,
-                    command_map,
-                    hop_by_hop_id_generator,
-                    end_to_end_id_generator,
-                    alarm_store,
-                    alarm_rest_path,
-                );
+                
                 if let Err(e) = http_listener.start().await {
                     error!("HttpRestListener error: {}", e);
                 }
@@ -477,36 +501,24 @@ impl DiameterStack {
             );
             for peer in peers {
                 let mut host_parts = peer.host.splitn(2, '@');
-                let my_host = self.config.host.clone();
-                let my_realm = self.config.realm.clone();
                 let peer_host = host_parts.next().unwrap_or_default().to_string();
                 let peer_realm = host_parts.next().unwrap_or_default().to_string();
                 info!("Configured peer with host {} and realm {} at {}", peer_host.clone(), peer_realm.clone(), peer.connection_url);
-                let conns = Self::create_connections(
+                let conns = self.create_connections(
                     peer.connection_url.as_str(),
-                    &my_host,
-                    &my_realm,
                     &peer_host,
                     &peer_realm,
                     &peer.cert_file.clone().unwrap_or_default(),
                     &peer.key_file.clone().unwrap_or_default(),
                     &peer.ca_cert_file.clone().unwrap_or_default(),
-                    avp_map,
                     command_map,
-                    &self.config,
-                    &self.hop_by_hop_id_generator,
-                    &self.end_to_end_id_generator,
-                    &self.connection_manager,
-                    &self.hop_by_hop_id_mapper,
+                    avp_map,
                     command_handler,
-                    &self.alarm_sender,
                 );
                 info!("Created {} connection(s) for peer {}@{} at {}", conns.len(), peer_host.clone(), peer_realm.clone(), peer.connection_url);
                 for conn in conns {
                     info!("Adding connection {}@{} to connection manager at {}", conn.get_peer_host().unwrap_or_default(), conn.get_peer_realm().unwrap_or_default(), peer.connection_url);
                     self.connection_manager
-                        .lock()
-                        .await
                         .add_connection(Arc::new(conn as Box<dyn Connection + Send + Sync>)).await;
                 }
             }
@@ -516,23 +528,16 @@ impl DiameterStack {
     }
 
     fn create_connections(
-        connection_url: &str,
-        my_host: &String,
-        my_realm: &String,
+        &self,
+        connection_url: &str,       
         peer_host: &String,
         peer_realm: &String,
-        cert_file: &String,
         key_file: &String,
+        cert_file: &String,
         ca_cert_file: &String,
-        avp_map: &AvpMap,
         command_map: &CommandMap,
-        stack_config: &StackConfig,
-        hop_to_hop_id_generator: &Arc<IdGenerator>,
-        end_to_end_id_generator: &Arc<IdGenerator>,
-        connection_manager: &Arc<Mutex<ConnectionManager>>,
-        hop_by_hop_id_mapper: &Arc<HopByHopIdMapper>,
+        avp_map: &AvpMap,
         command_handler: &Arc<DefaultCommandHandler>,
-        alarm_sender: &Option<AlarmSender>,
     ) -> Vec<Box<dyn Connection + Send + Sync>> {
         // Implement the logic to connect to a single peer
         // This may involve parsing the connection URL, establishing a TCP connection, etc.
@@ -547,26 +552,10 @@ impl DiameterStack {
                     LoadBalancerStrategy::RoundRobin(peers) => {
                         info!("Connecting to peers in round-robin: {}", peers);
                         // Implement round-robin connection logic here
-                        let conns = Self::create_connections(&peers, 
-                            my_host, 
-                            my_realm, 
-                            peer_host, 
-                            peer_realm, 
-                            cert_file,
-                            key_file, 
-                            ca_cert_file, 
-                            avp_map, 
-                            command_map, 
-                            stack_config, 
-                            hop_to_hop_id_generator, 
-                            end_to_end_id_generator, 
-                            connection_manager,
-                            hop_by_hop_id_mapper,
-                            command_handler,
-                            alarm_sender,);
+                        let conns = self.create_connections(&peers, peer_host, peer_realm, key_file, cert_file, ca_cert_file, command_map, avp_map, command_handler);
                         if conns.len() > 1 {
                             let arc_conns: Vec<Arc<Box<dyn Connection + Send + Sync>>> = conns.into_iter().map(|c| Arc::new(c)).collect();
-                            let conn = RoundRobinConnection::new(arc_conns);
+                            let conn = RoundRobinConnection::new(peer_host.clone(), peer_realm.clone(), arc_conns);
                             vec![Box::new(conn) as Box<dyn Connection + Send + Sync>]
                         } else {
                             conns
@@ -575,27 +564,10 @@ impl DiameterStack {
                     LoadBalancerStrategy::FailOver(peers) => {
                         info!("Connecting to peers with failover: {}", peers);
                         // Implement failover connection logic here
-                        let conns = Self::create_connections(&peers, 
-                            my_host, 
-                            my_realm,
-                            peer_host, 
-                            peer_realm, 
-                            cert_file, 
-                            key_file, 
-                            ca_cert_file, 
-                            avp_map, 
-                            command_map, 
-                            stack_config, 
-                            hop_to_hop_id_generator, 
-                            end_to_end_id_generator, 
-                            connection_manager,
-                            hop_by_hop_id_mapper,
-                            command_handler,
-                            alarm_sender,
-                            );
+                        let conns = self.create_connections(&peers, peer_host, peer_realm, key_file, cert_file, ca_cert_file, command_map, avp_map, command_handler);
                         if conns.len() > 1 {
                             let arc_conns: Vec<Arc<Box<dyn Connection + Send + Sync>>> = conns.into_iter().map(|c| Arc::new(c)).collect();
-                            let conn = FailOverConnection::new(arc_conns);
+                            let conn = FailOverConnection::new(peer_host.clone(), peer_realm.clone(), arc_conns);
                             vec![Box::new(conn) as Box<dyn Connection + Send + Sync>]
                         } else {
                             conns
@@ -604,23 +576,7 @@ impl DiameterStack {
                     LoadBalancerStrategy::Random(peers) => {
                         info!("Connecting to peers randomly: {}", peers);
                         // Implement random connection logic here
-                        let conns = Self::create_connections(&peers, 
-                            my_host, 
-                            my_realm, 
-                            peer_host, 
-                            peer_realm, 
-                            cert_file, 
-                            key_file, 
-                            ca_cert_file, 
-                            avp_map, 
-                            command_map, 
-                            stack_config, 
-                            hop_to_hop_id_generator, 
-                            end_to_end_id_generator, 
-                            connection_manager,
-                        hop_by_hop_id_mapper,
-                        command_handler,
-                        alarm_sender,);
+                        let conns = self.create_connections(&peers, peer_host, peer_realm, key_file, cert_file, ca_cert_file, command_map, avp_map, command_handler);
                         if conns.len() > 1 {
                             let arc_conns: Vec<Arc<Box<dyn Connection + Send + Sync>>> = conns.into_iter().map(|c| Arc::new(c)).collect();
                             let conn = RandomConnection::new(arc_conns);
@@ -643,27 +599,66 @@ impl DiameterStack {
                                     if addr.protocol.to_lowercase() == "tcp" {
                                         let conn = TcpClientConnection::new(
                                             format!("{}:{}", addr.hosts[0], addr.port),
-                                            my_host.clone(),
-                                            my_realm.clone(),
+                                            self.config.host.clone(),
+                                            self.config.realm.clone(),
                                             peer_host.clone(),
                                             peer_realm.clone(),
-                                            stack_config.capability.clone(),
+                                            self.config.capability.clone(),
                                             key_file.clone(),
                                             cert_file.clone(),
                                             ca_cert_file.clone(),
-                                            hop_to_hop_id_generator.clone(),
-                                            end_to_end_id_generator.clone(),
-                                            stack_config.cer_timeout.unwrap_or(3),
-                                            connection_manager.clone(),
-                                            hop_by_hop_id_mapper.clone(),
+                                            self.hop_by_hop_id_generator.clone(),
+                                            self.end_to_end_id_generator.clone(),                                            
+                                            command_map.clone(),
+                                            avp_map.clone(),
+                                            self.config.cer_timeout.map_or(Duration::from_secs(3), |t| Duration::from_millis(t)),
+                                            self.connection_manager.clone(),
+                                            self.hop_by_hop_id_mapper.clone(),        
+                                            self.answer_manager.clone(),                                    
                                             command_handler.clone(),
-                                            alarm_sender.clone(),
+                                            self.alarm_sender.clone(),
+                                            self.redirect_host_manager.clone()
                                         );
                                         conn.spawn_start();
                                         Some(Box::new(conn) as Box<dyn Connection + Send + Sync>)
                                     } else if addr.protocol.to_lowercase() == "sctp" {
-                                        error!("SCTP protocol is not yet supported for connection URL '{}'", values[0]);
-                                        None
+                                        #[cfg(target_os = "linux")]
+                                        {
+                                            let addresses = addr
+                                                .hosts
+                                                .iter()
+                                                .map(|host| format!("{}:{}", host, addr.port))
+                                                .collect();
+                                            let conn = SctpClientConnection::new(
+                                                addresses,
+                                                self.config.host.clone(),
+                                                self.config.realm.clone(),
+                                                peer_host.clone(),
+                                                peer_realm.clone(),
+                                                key_file.clone(),
+                                                cert_file.clone(),
+                                                ca_cert_file.clone(),
+                                                self.hop_by_hop_id_generator.clone(),
+                                                self.end_to_end_id_generator.clone(),
+                                                self.hop_by_hop_id_mapper.clone(),
+                                                command_map.clone(),
+                                                avp_map.clone(),
+                                                self.connection_manager.clone(),
+                                                self.answer_manager.clone(),
+                                                self.redirect_host_manager.clone(),
+                                                command_handler.clone(),
+                                            );
+                                            conn.spawn_start();
+                                            Some(Box::new(conn) as Box<dyn Connection + Send + Sync>)
+                                        }
+                                        #[cfg(not(target_os = "linux"))]
+                                        {
+                                            error!(
+                                                "SCTP protocol is only supported on Linux for connection URL '{}'",
+                                                values[0]
+                                            );
+                                            None
+                                        }
                                     }  else {
                                         error!("Unsupported protocol in connection URL '{}': {}", values[0], addr.protocol);
                                         None
@@ -680,7 +675,7 @@ impl DiameterStack {
                             // Implement custom value-based connection logic here
                             values
                                 .into_iter()
-                                .flat_map(|v| Self::create_connections(&v, my_host, my_realm, peer_host, peer_realm, cert_file, key_file, ca_cert_file, avp_map, command_map, stack_config, hop_to_hop_id_generator, end_to_end_id_generator, connection_manager, hop_by_hop_id_mapper, command_handler, alarm_sender))
+                                .flat_map(|v| self.create_connections(&v,  peer_host, peer_realm, cert_file, key_file, ca_cert_file, command_map, avp_map, command_handler))
                                 .collect()
                         }
                     }
@@ -688,6 +683,7 @@ impl DiameterStack {
             })
             .unwrap_or_default()
     }
+
 
     // Additional methods for managing the stack, sending commands, etc.
 }

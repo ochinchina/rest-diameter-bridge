@@ -19,6 +19,10 @@ async fn test_failover_connection() {
         "test".to_string(),
         "example.com".to_string(),
     )) as Box<dyn Connection + Send + Sync>);
-    let failover = FailOverConnection::new(vec![connection1, connection2]);
+    let failover = FailOverConnection::new(
+        "test".to_string(),
+        "example.com".to_string(),
+        vec![connection1, connection2],
+    );
     failover.send(&command).await.unwrap();
 }

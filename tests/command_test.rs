@@ -1,7 +1,6 @@
 use rest_diameter_bridge::avp::{Avp, AvpFlags, AvpJson, AvpMap, AvpType};
 use rest_diameter_bridge::command::{
-    Command, CommandJson, CommandMap, create_command_from_json_str, create_json_from_command,
-    load_command_definition_from_yaml_file,
+    Command, CommandJson, CommandMap, load_command_definition_from_yaml_file,
 };
 use std::collections::HashMap;
 
@@ -41,7 +40,7 @@ fn test_create_command_from_json() {
 
     let avp_map = AvpMap::new(avp_map);
     let command_map = CommandMap::new(commands); // Use the commands vector for this test
-    let command = create_command_from_json_str(json, &command_map, &avp_map).unwrap();
+    let command = Command::from_json_str(json, &command_map, &avp_map).unwrap();
     print!("Created Command: {}\n", command);
     assert_eq!(command.code, 123);
     assert_eq!(command.flags, 0x80); // Request flag set
@@ -103,7 +102,7 @@ fn test_create_json_from_command() {
     let command_map = CommandMap::new(commands);
     let command = Command::new(123, 0x80, 456, 1, 1, vec![avp, avp2, avp3]);
     println!("command: {}", command);
-    let json = create_json_from_command(&command, &command_map, &avp_map);
+    let json = command.to_json(&command_map, &avp_map);
     println!("Generated JSON: {}", json);
 }
 

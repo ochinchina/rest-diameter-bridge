@@ -1,21 +1,18 @@
+use crate::transport::AnswerManager;
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use log::{error, info};
-use std::{sync::Arc, time::Duration};
-use tokio::sync::Mutex;
-use tokio::sync::mpsc::Receiver;
+use std::sync::Arc;
 
+use crate::avp::ResultCode;
 use crate::{
     alarm::AlarmStore,
     avp::AvpMap,
-    command::{
-        Command, CommandMap, create_command_from_json_value, create_json_from_command,
-        create_json_from_command_pretty,
-    },
+    command::{Command, CommandMap},
     metrics::{RESTFUL_REQUESTS, gather_metrics},
-    transport::{ConnectionManager, DefaultCommandHandler, IdGenerator},
+    transport::{ConnectionManager, IdGenerator},
     utils::load_rustls_config,
 };
 
@@ -25,30 +22,30 @@ pub struct HttpRestListener {
     host: String,
     realm: String,
     path: String,
-    command_handler: Arc<DefaultCommandHandler>,
     cert_file: String,
     key_file: String,
     ca_cert_file: String,
-    connection_manager: Arc<Mutex<ConnectionManager>>,
+    connection_manager: Arc<Box<ConnectionManager>>,
     avp_map: AvpMap,
     command_map: CommandMap,
-    hop_by_hop_id_generator: Arc<IdGenerator>,
-    end_to_end_id_generator: Arc<IdGenerator>,
+    hop_by_hop_id_generator: Arc<Box<IdGenerator>>,
+    end_to_end_id_generator: Arc<Box<IdGenerator>>,
     alarm_store: Option<AlarmStore>,
     alarm_rest_path: Option<String>,
+    answer_manager: Arc<Box<AnswerManager>>,
 }
 
 #[derive(Clone)]
 struct HttpRestListenerState {
     host: String,
     realm: String,
-    command_handler: Arc<DefaultCommandHandler>,
-    connection_manager: Arc<Mutex<ConnectionManager>>,
+    connection_manager: Arc<Box<ConnectionManager>>,
     avp_map: AvpMap,
     command_map: CommandMap,
-    hop_by_hop_id_generator: Arc<IdGenerator>,
-    end_to_end_id_generator: Arc<IdGenerator>,
+    hop_by_hop_id_generator: Arc<Box<IdGenerator>>,
+    end_to_end_id_generator: Arc<Box<IdGenerator>>,
     alarm_store: Option<AlarmStore>,
+    answer_manager: Arc<Box<AnswerManager>>,
 }
 
 impl HttpRestListener {
@@ -58,17 +55,17 @@ impl HttpRestListener {
         host: String,
         realm: String,
         path: String,
-        command_handler: Arc<DefaultCommandHandler>,
         cert_file: String,
         key_file: String,
         ca_cert_file: String,
-        connection_manager: Arc<Mutex<ConnectionManager>>,
+        connection_manager: Arc<Box<ConnectionManager>>,
         avp_map: AvpMap,
         command_map: CommandMap,
-        hop_by_hop_id_generator: Arc<IdGenerator>,
-        end_to_end_id_generator: Arc<IdGenerator>,
+        hop_by_hop_id_generator: Arc<Box<IdGenerator>>,
+        end_to_end_id_generator: Arc<Box<IdGenerator>>,
         alarm_store: Option<AlarmStore>,
         alarm_rest_path: Option<String>,
+        answer_manager: Arc<Box<AnswerManager>>,
     ) -> Self {
         info!(
             "Creating HttpRestListener with address: {}, host: {}, realm: {}, path: {}, cert_file: {}, key_file: {}, ca_cert_file: {}",
@@ -79,7 +76,6 @@ impl HttpRestListener {
             host,
             realm,
             path,
-            command_handler,
             cert_file,
             key_file,
             ca_cert_file,
@@ -90,6 +86,7 @@ impl HttpRestListener {
             end_to_end_id_generator,
             alarm_store,
             alarm_rest_path,
+            answer_manager,
         }
     }
 
@@ -105,7 +102,7 @@ impl HttpRestListener {
         info!("Received HTTP request with body: {}", body);
         RESTFUL_REQUESTS.inc();
 
-        let mut command = create_command_from_json_value(&v, &state.command_map, &state.avp_map)
+        let mut command = Command::from_json_value(&v, &state.command_map, &state.avp_map)
             .map_err(|e| {
                 error!("Failed to parse incoming JSON command: {}", e);
                 (
@@ -149,6 +146,15 @@ impl HttpRestListener {
             command.get_destination_realm().unwrap_or_default()
         );
 
+        state
+            .answer_manager
+            .prepare_for_answer(
+                command.hop_by_hop_id,
+                "".to_string(),
+                state.host.clone(),
+                state.realm.clone(),
+            )
+            .await;
         let callback_url = v
             .as_object()
             .ok_or_else(|| {
@@ -160,151 +166,102 @@ impl HttpRestListener {
             })?
             .get("callback-url")
             .and_then(|v| v.as_str())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_string();
 
-        if callback_url == "" {
-            info!("No callback URL provided, using channel callback for response");
-            let (sender, mut receiver) = tokio::sync::mpsc::channel::<Command>(1);
-
-            state.command_handler.add_answer_sender_with_request(
-                command.hop_by_hop_id,
-                sender,
-                &command,
-            );
-
-            match Self::send_command(
-                &state.connection_manager,
-                &command,
-                &state.command_map,
-                &state.avp_map,
-            )
-            .await
-            {
-                Ok(_) => {
-                    info!(
-                        "Diameter {} with code {}: {} is sent successfully, waiting for response through channel callback",
-                        if command.is_request() {
-                            "request"
-                        } else {
-                            "answer"
-                        },
-                        command.code,
-                        create_json_from_command_pretty(
-                            &command,
-                            &state.command_map,
-                            &state.avp_map
+        if callback_url != "" {
+            tokio::spawn(async move {
+                info!(
+                    "Callback URL provided: {}, will send response to this URL",
+                    callback_url
+                );
+                let (_status_code, content_type, message) = match Self::send_request(
+                    &state.connection_manager,
+                    &command,
+                    &state.command_map,
+                    &state.avp_map,
+                )
+                .await
+                {
+                    Ok((status_code, message)) => {
+                        info!(
+                            "Successfully routed diameter message: HTTP {}, Content-Type: {}",
+                            status_code, "application/json"
+                        );
+                        (status_code, "application/json".to_string(), message)
+                    }
+                    Err((status_code, message)) => {
+                        error!("Failed to route diameter message: {}", message);
+                        (
+                            status_code,
+                            "text/plain".to_string(),
+                            format!("Failed to route diameter message: {}", message),
                         )
+                    }
+                };
+                if let Err(e) = send_message_to_url(&callback_url, &content_type, &message).await {
+                    error!(
+                        "Failed to send response to callback URL {}: {}",
+                        callback_url, e
                     );
-                    Self::receive_response(
-                        &mut receiver,
-                        Duration::from_secs(30),
-                        &state.command_map,
-                        &state.avp_map,
-                    )
-                    .await
-                }
-                Err(e) => {
-                    error!("Failed to route diameter message: {}", e);
-                    return Err((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("Failed to route diameter message: {}", e),
-                    ));
-                }
-            }
-        } else {
-            info!("Callback URL provided: {}", callback_url);
-            state.command_handler.add_answer_url_with_request(
-                command.hop_by_hop_id,
-                callback_url,
-                &command,
-            );
-
-            match Self::send_command(
-                &state.connection_manager,
-                &command,
-                &state.command_map,
-                &state.avp_map,
-            )
-            .await
-            {
-                Ok(_) => {
+                } else {
                     info!(
-                        "Diameter {} with code {}: {} is sent successfully, response will be sent to callback URL: {}",
-                        if command.is_request() {
-                            "request"
-                        } else {
-                            "answer"
-                        },
-                        command.code,
-                        create_json_from_command_pretty(
-                            &command,
-                            &state.command_map,
-                            &state.avp_map
-                        ),
+                        "Successfully sent response to callback URL {}",
                         callback_url
                     );
-                    Ok((StatusCode::OK, "Message sent".to_string()))
                 }
-                Err(e) => {
-                    error!("Failed to route diameter message: {}", e);
-                    Err((
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("Failed to route diameter message: {}", e),
-                    ))
-                }
-            }
+            });
+            return Ok((
+                StatusCode::OK,
+                "Message sent, response will be sent to callback URL".to_string(),
+            ));
+        } else {
+            Self::send_request(
+                &state.connection_manager,
+                &command,
+                &state.command_map,
+                &state.avp_map,
+            )
+            .await
         }
     }
 
-    async fn send_command(
-        connection_manager: &Arc<Mutex<ConnectionManager>>,
+    async fn send_request(
+        connection_manager: &Arc<Box<ConnectionManager>>,
         command: &Command,
         command_map: &CommandMap,
         avp_map: &AvpMap,
-    ) -> Result<(), String> {
+    ) -> Result<(StatusCode, String), (StatusCode, String)> {
         info!(
             "Try to send command: {} through connection manager",
-            create_json_from_command_pretty(command, command_map, avp_map)
+            command.to_pretty_json_str(command_map, avp_map)
         );
-        connection_manager
-            .lock()
-            .await
-            .find_send_command(command)
-            .await
-    }
-
-    async fn receive_response(
-        rx: &mut Receiver<Command>,
-        timeout: Duration,
-        command_map: &CommandMap,
-        avp_map: &AvpMap,
-    ) -> Result<(StatusCode, String), (StatusCode, String)> {
-        match tokio::time::timeout(timeout, rx.recv()).await {
-            Ok(result) => match result {
-                Some(response_command) => {
-                    let json_response = serde_json::to_string(&create_json_from_command(
-                        &response_command,
-                        command_map,
-                        avp_map,
-                    ))
-                    .map_err(|e| {
-                        error!("Failed to serialize response command to JSON: {}", e);
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to serialize response command to JSON: {}", e),
-                        )
-                    })?;
-                    Ok((StatusCode::OK, json_response))
-                }
-                None => Err((
+        match connection_manager.send_request(command).await {
+            Ok(answer) => {
+                let result_code = answer
+                    .get_result_code()
+                    .unwrap_or(ResultCode::DiameterSuccess as u32);
+                info!(
+                    "Diameter command sent successfully, received answer with result code: {}",
+                    result_code
+                );
+                let json_response = answer.to_json(command_map, avp_map);
+                let json_response = serde_json::to_string(&json_response).map_err(|e| {
+                    error!("Failed to serialize response command to JSON: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to serialize response command to JSON: {}", e),
+                    )
+                })?;
+                return Ok((StatusCode::OK, json_response));
+            }
+            Err(e) => {
+                error!("Failed to send Diameter command: {}", e);
+                return Err((
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "Failed to receive response command through channel callback".to_string(),
-                )),
-            },
-            Err(_) => Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Timeout waiting for response command".to_string(),
-            )),
+                    format!("Failed to send Diameter command: {}", e),
+                ));
+            }
         }
     }
 
@@ -328,13 +285,13 @@ impl HttpRestListener {
         let app_state = HttpRestListenerState {
             host,
             realm,
-            command_handler: self.command_handler.clone(),
             connection_manager: cm,
             command_map: cmd_map,
             avp_map: avp_map_clone,
             hop_by_hop_id_generator,
             end_to_end_id_generator,
             alarm_store: self.alarm_store.clone(),
+            answer_manager: self.answer_manager.clone(),
         };
 
         let shared_state = Arc::new(app_state);
@@ -400,7 +357,7 @@ impl HttpRestListener {
             )
         })?;
 
-        let alarms = store.get_active_alarms();
+        let alarms = store.get_active_alarms().await;
         let json = serde_json::to_string(&alarms).map_err(|e| {
             error!("Failed to serialize alarms: {}", e);
             (
@@ -422,7 +379,7 @@ impl HttpRestListener {
             )
         })?;
 
-        match store.get_alarm(&alarm_id) {
+        match store.get_alarm(&alarm_id).await {
             Some(alarm) => {
                 let json = serde_json::to_string(&alarm).map_err(|e| {
                     error!("Failed to serialize alarm: {}", e);
@@ -444,5 +401,29 @@ impl HttpRestListener {
         State(_state): State<Arc<HttpRestListenerState>>,
     ) -> (StatusCode, String) {
         (StatusCode::OK, gather_metrics())
+    }
+}
+
+async fn send_message_to_url(url: &str, content_type: &str, message: &str) -> Result<(), String> {
+    match reqwest::Client::new()
+        .post(url)
+        .header("Content-Type", content_type)
+        .body(message.to_string())
+        .send()
+        .await
+    {
+        Ok(response) => {
+            let status_code = response.status().as_u16();
+            if status_code >= 200 && status_code < 400 {
+                info!("Successfully sent message to {}: HTTP {}", url, status_code);
+                Ok(())
+            } else {
+                Err(format!(
+                    "Failed to send message to {}: HTTP {}",
+                    url, status_code
+                ))
+            }
+        }
+        Err(e) => Err(format!("Failed to send message to {}: {}", url, e)),
     }
 }

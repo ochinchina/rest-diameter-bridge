@@ -34,17 +34,24 @@ impl RoutingItem {
 }
 
 #[derive(Clone)]
+/// Routes outgoing Diameter commands to the correct next-hop connection based on
+/// destination host/realm and application ID, using a configurable [`RoutingPolicy`].
 pub struct RoutingConnectionManager {
     // Fields for managing routing connections
     policy: RoutingPolicy,
+    // Mapping of host/realm to routing items
     routing_connections: Arc<HashMap<String, RoutingItem>>,
     default_routing_connection: Option<Arc<Box<dyn Connection + Send + Sync>>>,
 }
 
 impl RoutingConnectionManager {
-    pub fn new(stack_routing: StackRoutingConfig) -> Self {
+    /// Creates a new `RoutingConnectionManager` from a [`StackRoutingConfig`].
+    ///
+    /// Parses the routing policy, instantiates a default route connection if configured,
+    /// and builds per-host/realm routing items from the `items` list.
+    pub fn new(stack_routing: &StackRoutingConfig) -> Self {
         let mut manager = RoutingConnectionManager {
-            policy: RoutingPolicy::from_str(&stack_routing.policy).unwrap_or(RoutingPolicy::Realm),
+            policy: RoutingPolicy::from_str(&stack_routing.policy).unwrap_or_default(),
             routing_connections: Arc::new(HashMap::new()),
             default_routing_connection: None,
         };
@@ -91,6 +98,9 @@ impl RoutingConnectionManager {
         manager
     }
 
+    /// Registers a peer connection with all matching routing items and the default route.
+    ///
+    /// The connection's peer host and realm are used to determine which routing items it belongs to.
     pub async fn add_connection(&self, connection: Arc<Box<dyn Connection + Send + Sync>>) {
         let host = connection.get_peer_host().unwrap_or_default();
         let realm = connection.get_peer_realm().unwrap_or_default();
@@ -120,6 +130,7 @@ impl RoutingConnectionManager {
                 "Try to add connection with host: {}, realm: {} to default routing connection",
                 host, realm
             );
+            println!("Adding connection with host: {}, realm: {} to default routing connection", host, realm);
             default_conn.add_connection(connection).await;
         }
         info!(
@@ -128,6 +139,7 @@ impl RoutingConnectionManager {
         );
     }
 
+    /// Removes a peer connection from all matching routing items and the default route.
     pub async fn remove_connection(&self, connection: Arc<Box<dyn Connection + Send + Sync>>) {
         let host = connection.get_peer_host().unwrap_or_default();
         let realm = connection.get_peer_realm().unwrap_or_default();
@@ -144,6 +156,54 @@ impl RoutingConnectionManager {
         }
     }
 
+    pub async fn get_connections_for_command(
+        &self,
+        command: &Command,
+        connections: &mut Vec<Arc<Box<dyn Connection + Send + Sync>>>,
+    ) {
+        let host = command.get_destination_host().unwrap_or_default();
+        let realm = command.get_destination_realm().unwrap_or_default();
+        let app_id = command.get_application_id();
+
+        let key = match self.policy {
+            RoutingPolicy::Realm => realm.to_string(),
+            RoutingPolicy::Host => format!("{}@{}", host, realm),
+        };
+
+        if let Some(item) = self.routing_connections.get(&key) {
+            if item.contains_app_id(app_id) {
+                info!(
+                    "Found routing connection for host: {}, realm: {}, app_id: {} with key: {}",
+                    host, realm, app_id, key
+                );
+
+                item.routing_connection.get_connections(connections).await;
+                return;
+            }
+        }
+
+        if let Some(default_routing_connection) = self.default_routing_connection.as_ref() {
+            info!(
+                "Using default routing connection for host: {}, realm: {}, app_id: {}",
+                host, realm, app_id
+            );
+            println!("Using default routing connection for host: {}, realm: {}, app_id: {}", host, realm, app_id);
+            default_routing_connection
+                .get_connections(connections)
+                .await;
+            return;
+        }
+
+        error!(
+            "No routing connection found for host: {}, realm: {}, app_id: {} with key: {}",
+            host, realm, app_id, key
+        );
+    }
+
+    /// Sends `command` to the appropriate next-hop connection determined by the routing policy.
+    ///
+    /// Matches by host/realm key first; falls back to the default route if configured.
+    /// Returns `Err` if no suitable connection is found.
     pub async fn find_send_command(&self, command: &Command) -> Result<(), String> {
         let host = command.get_destination_host().unwrap_or_default();
         let realm = command.get_destination_realm().unwrap_or_default();
@@ -197,15 +257,17 @@ impl RoutingConnectionManager {
 
 pub struct RoutingConnection {
     id: String,
+    // The underlying connection that handles the actual sending of commands
     connection: Arc<Box<dyn Connection + Send + Sync>>,
-    host_realm_connections: HashMap<String, Arc<Box<dyn Connection + Send + Sync>>>, // Map of (host, realm) to connections
+    // Mapping of host/realm to connections for routing purposes
+    host_realm_connections: HashMap<String, Arc<Box<dyn Connection + Send + Sync>>>,
 }
 
 impl RoutingConnection {
     pub fn new(config: String) -> Self {
         let mut rc = RoutingConnection {
             id: "routing-connection-".to_owned() + &uuid::Uuid::new_v4().to_string(),
-            connection: Arc::new(Box::new(RoundRobinConnection::new(vec![]))),
+            connection: Arc::new(Box::new(RoundRobinConnection::new("unknown-peer".to_string(), "unknown-realm".to_string(), vec![]))),
             host_realm_connections: HashMap::new(),
         };
         if let Some(connections) =
@@ -214,7 +276,7 @@ impl RoutingConnection {
             if connections.len() == 1 {
                 rc.connection = connections[0].clone();
             } else if connections.len() > 1 {
-                rc.connection = Arc::new(Box::new(RoundRobinConnection::new(connections.clone())));
+                rc.connection = Arc::new(Box::new(RoundRobinConnection::new("unknown-peer".to_string(), "unknown-realm".to_string(), connections.clone())));
             } else {
                 error!(
                     "No valid connections created from config: {}, using empty routing connection",
@@ -230,6 +292,13 @@ impl RoutingConnection {
         rc
     }
 
+    /// Creates connections based on the provided configuration string and populates the host_realm_connections map.
+    /// Returns a vector of created connections.
+    /// # Arguments
+    /// - `config`: The configuration string for creating connections.
+    /// - `host_realm_connections`: A mutable reference to the map of host/realm to connections.
+    /// # Returns
+    /// An `Option` containing a vector of created connections if successful, or `None` if no connections could be created.
     pub fn create_connection_from(
         config: String,
         host_realm_connections: &mut HashMap<String, Arc<Box<dyn Connection + Send + Sync>>>,
@@ -245,9 +314,7 @@ impl RoutingConnection {
                     if let Some(connections) =
                         Self::create_connection_from(s, host_realm_connections)
                     {
-                        return Some(vec![Arc::new(Box::new(RoundRobinConnection::new(
-                            connections,
-                        )))]);
+                        return Some(vec![Arc::new(Box::new(RoundRobinConnection::new("unknown-peer".to_string(), "unknown-realm".to_string(), connections)))]);
                     }
                 }
                 LoadBalancerStrategy::Random(s) => {
@@ -261,9 +328,7 @@ impl RoutingConnection {
                     if let Some(connections) =
                         Self::create_connection_from(s, host_realm_connections)
                     {
-                        return Some(vec![Arc::new(Box::new(FailOverConnection::new(
-                            connections,
-                        )))]);
+                        return Some(vec![Arc::new(Box::new(FailOverConnection::new("unknown-peer".to_string(), "unknown-realm".to_string(), connections)))]);                            
                     }
                 }
                 LoadBalancerStrategy::Value(v) => {
@@ -273,7 +338,7 @@ impl RoutingConnection {
                             v[0].clone()
                         );
                         let conn: Arc<Box<dyn Connection + Send + Sync>> =
-                            Arc::new(Box::new(RoundRobinConnection::new(vec![])));
+                            Arc::new(Box::new(RoundRobinConnection::new("unknown-peer".to_string(), "unknown-realm".to_string(), vec![])));
 
                         host_realm_connections.insert(v[0].clone(), conn.clone());
                         return Some(vec![conn]);
@@ -350,6 +415,10 @@ impl Connection for RoutingConnection {
                 );
             }
         }
+    }
+
+    async fn get_connections(&self, connections: &mut Vec<Arc<Box<dyn Connection + Send + Sync>>>) {
+        self.connection.get_connections(connections).await;
     }
 
     fn iter(

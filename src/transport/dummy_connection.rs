@@ -1,8 +1,13 @@
+use std::sync::Arc;
+
 use log::info;
 
 use crate::command::Command;
 use crate::transport::Connection;
 
+/// A no-op [`Connection`] that logs sent commands and always reports success.
+///
+/// Intended for testing and development without a live Diameter peer.
 #[derive(Clone)]
 pub struct DummyConnection {
     id: String,
@@ -11,6 +16,12 @@ pub struct DummyConnection {
 }
 
 impl DummyConnection {
+    /// Creates a new `DummyConnection`.
+    ///
+    /// # Arguments
+    /// * `id` - Unique identifier for this connection.
+    /// * `peer_host` - Simulated peer Diameter host identity.
+    /// * `peer_realm` - Simulated peer Diameter realm.
     pub fn new(id: String, peer_host: String, peer_realm: String) -> Self {
         DummyConnection {
             id: id.clone(),
@@ -44,6 +55,13 @@ impl Connection for DummyConnection {
 
     async fn is_closed(&self) -> bool {
         false
+    }
+
+    async fn get_connections(
+        &self,
+        _connections: &mut Vec<Arc<Box<dyn Connection + Send + Sync>>>,
+    ) {
+        // DummyConnection does not manage multiple connections, so this is a no-op.
     }
 
     fn get_peer_host(&self) -> Result<String, String> {

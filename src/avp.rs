@@ -7,11 +7,13 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr},
 };
 
+/// Bit-flag constants for the AVP flags octet defined in RFC 6733.
 pub enum AvpFlags {
     VendorSpecific = 0x80,
     Mandatory = 0x40,
 }
 
+/// Standard AVP codes defined in RFC 6733 and related specifications.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AvpCode {
     AcctInterimInterval = 85,
@@ -66,10 +68,53 @@ pub enum AvpCode {
 }
 
 impl AvpCode {
+    /// Returns the numeric AVP code value as a `u32`.
     pub fn as_u32(&self) -> u32 {
         *self as u32
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectHostUsage {
+    DontCache = 0,
+    AllSession = 1,
+    AllRealm = 2,
+    RealmAndApplication = 3,
+    AllApplication = 4,
+    AllHost = 5,
+    AllUser = 6,
+}
+
+impl Default for RedirectHostUsage {
+    fn default() -> Self {
+        RedirectHostUsage::DontCache
+    }
+}
+
+impl RedirectHostUsage {
+    /// Converts a u32 value to a RedirectHostUsage enum variant.
+    /// # Arguments
+    /// * `value` - The u32 value to convert.
+    /// # Returns
+    /// * `Option<RedirectHostUsage>` - Some variant if the value is valid, None otherwise.
+    pub fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(RedirectHostUsage::DontCache),
+            1 => Some(RedirectHostUsage::AllSession),
+            2 => Some(RedirectHostUsage::AllRealm),
+            3 => Some(RedirectHostUsage::RealmAndApplication),
+            4 => Some(RedirectHostUsage::AllApplication),
+            5 => Some(RedirectHostUsage::AllHost),
+            6 => Some(RedirectHostUsage::AllUser),
+            _ => None,
+        }
+    }
+}
+
+/// Diameter result codes as defined in RFC 6733 §7.1.
+///
+/// Grouped into informational (1xxx), success (2xxx), protocol errors (3xxx),
+/// transient failures (4xxx), and permanent failures (5xxx).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultCode {
     DiameterMultiRoundAuth = 1001,
@@ -108,34 +153,42 @@ pub enum ResultCode {
 }
 
 impl ResultCode {
+    /// Returns the numeric result code value as a `u32`.
     pub fn as_u32(&self) -> u32 {
         *self as u32
     }
+
+    /// Returns `true` if this is an informational result code (1xxx).
     pub fn is_informational(&self) -> bool {
         let code = self.as_u32();
         code >= 1000 && code < 2000
     }
 
+    /// Returns `true` if this is a success result code (2xxx).
     pub fn is_success(&self) -> bool {
         let code = self.as_u32();
         code >= 2000 && code < 3000
     }
 
+    /// Returns `true` if this is a protocol error result code (3xxx).
     pub fn is_protocol_errors(&self) -> bool {
         let code = self.as_u32();
         code >= 3000 && code < 4000
     }
 
+    /// Returns `true` if this is a transient failure result code (4xxx).
     pub fn is_transient_failure(&self) -> bool {
         let code = self.as_u32();
         code >= 4000 && code < 5000
     }
 
+    /// Returns `true` if this is a permanent failure result code (5xxx).
     pub fn is_permanent_failure(&self) -> bool {
         let code = self.as_u32();
         code >= 5000 && code < 6000
     }
 }
+/// The data type of an AVP value, as defined in RFC 6733 §4.2.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum AvpType {
     Address,
@@ -200,6 +253,10 @@ impl From<AvpType> for String {
     }
 }
 
+/// A Diameter AVP (Attribute-Value Pair) as defined in RFC 6733 §4.
+///
+/// An AVP consists of a code, flags, an optional vendor ID, and either raw `data`
+/// (for scalar types) or `sub_avps` (for grouped AVPs).
 #[derive(Debug, Clone)]
 pub struct Avp {
     pub code: u32,
@@ -210,6 +267,13 @@ pub struct Avp {
 }
 
 impl Avp {
+    /// Creates a new AVP with raw byte data.
+    ///
+    /// # Arguments
+    /// * `code` - The AVP code.
+    /// * `flags` - The AVP flags byte (vendor-specific and mandatory bits are handled automatically).
+    /// * `vendor_id` - Optional vendor ID for vendor-specific AVPs.
+    /// * `data` - The raw encoded value bytes.
     pub fn new(code: u32, flags: u8, vendor_id: Option<u32>, data: Vec<u8>) -> Self {
         Avp {
             code,
@@ -220,31 +284,37 @@ impl Avp {
         }
     }
 
+    /// Creates an OctetString AVP from a UTF-8 string slice treated as raw bytes.
     pub fn from_octet_string(code: u32, flags: u8, vendor_id: Option<u32>, value: &str) -> Self {
         let data = value.as_bytes().to_vec();
         Avp::new(code, flags, vendor_id, data)
     }
 
+    /// Creates a UTF8String AVP from a string slice.
     pub fn from_utf8_string(code: u32, flags: u8, vendor_id: Option<u32>, value: &str) -> Self {
         let data = value.as_bytes().to_vec();
         Avp::new(code, flags, vendor_id, data)
     }
 
+    /// Creates an Integer32 AVP from a signed 32-bit integer (big-endian encoded).
     pub fn from_integer32(code: u32, flags: u8, vendor_id: Option<u32>, value: i32) -> Self {
         let data = value.to_be_bytes().to_vec();
         Avp::new(code, flags, vendor_id, data)
     }
 
+    /// Creates an Unsigned32 AVP from an unsigned 32-bit integer (big-endian encoded).
     pub fn from_unsigned32(code: u32, flags: u8, vendor_id: Option<u32>, value: u32) -> Self {
         let data = value.to_be_bytes().to_vec();
         Avp::new(code, flags, vendor_id, data)
     }
 
+    /// Creates a Float32 AVP from a 32-bit floating-point value (big-endian encoded).
     pub fn from_float32(code: u32, flags: u8, vendor_id: Option<u32>, value: f32) -> Self {
         let data = value.to_be_bytes().to_vec();
         Avp::new(code, flags, vendor_id, data)
     }
 
+    /// Creates a Float64 AVP from a 64-bit floating-point value (big-endian encoded).
     pub fn from_float64(code: u32, flags: u8, vendor_id: Option<u32>, value: f64) -> Self {
         let data = value.to_be_bytes().to_vec();
         Avp::new(code, flags, vendor_id, data)
@@ -271,6 +341,7 @@ impl Avp {
         return Avp::from_unsigned32(code, flags, vendor_id, v);
     }
 
+    /// Creates a Grouped AVP containing the given sub-AVPs.
     pub fn from_grouped(code: u32, flags: u8, vendor_id: Option<u32>, sub_avps: Vec<Avp>) -> Self {
         Avp {
             code,
@@ -281,14 +352,18 @@ impl Avp {
         }
     }
 
+    /// Returns `true` if the vendor-specific flag bit is set.
     pub fn is_vendor_specific(&self) -> bool {
         self.flags & 0x80 != 0
     }
 
+    /// Returns `true` if this AVP holds sub-AVPs rather than a flat data value.
     pub fn is_grouped(&self) -> bool {
         self.data.is_none() && !self.sub_avps.is_empty()
     }
 
+    /// Decodes the AVP data as an Integer32 value.
+    /// Returns `None` if the data is absent or not exactly 4 bytes.
     pub fn as_integer32(&self) -> Option<i32> {
         if let Some(data) = self.data.as_ref() {
             if data.len() == 4 {
@@ -298,10 +373,13 @@ impl Avp {
         None
     }
 
+    /// Encodes and stores the given Integer32 value as the AVP data.
     pub fn set_integer32(&mut self, value: i32) {
         self.data = Some(value.to_be_bytes().to_vec());
     }
 
+    /// Decodes the AVP data as an Unsigned32 value.
+    /// Returns `None` if the data is absent or not exactly 4 bytes.
     pub fn as_unsigned32(&self) -> Option<u32> {
         if let Some(data) = self.data.as_ref() {
             if data.len() == 4 {
@@ -311,10 +389,13 @@ impl Avp {
         None
     }
 
+    /// Encodes and stores the given Unsigned32 value as the AVP data.
     pub fn set_unsigned32(&mut self, value: u32) {
         self.data = Some(value.to_be_bytes().to_vec());
     }
 
+    /// Decodes the AVP data as an Integer64 value.
+    /// Returns `None` if the data is absent or not exactly 8 bytes.
     pub fn as_integer64(&self) -> Option<i64> {
         if let Some(data) = self.data.as_ref() {
             if data.len() == 8 {
@@ -326,9 +407,13 @@ impl Avp {
         None
     }
 
+    /// Encodes and stores the given Integer64 value as the AVP data.
     pub fn set_integer64(&mut self, value: i64) {
         self.data = Some(value.to_be_bytes().to_vec());
     }
+
+    /// Decodes the AVP data as an Unsigned64 value.
+    /// Returns `None` if the data is absent or not exactly 8 bytes.
     pub fn as_unsigned64(&self) -> Option<u64> {
         if let Some(data) = self.data.as_ref() {
             if data.len() == 8 {
@@ -340,18 +425,23 @@ impl Avp {
         None
     }
 
+    /// Encodes and stores the given Unsigned64 value as the AVP data.
     pub fn set_unsigned64(&mut self, value: u64) {
         self.data = Some(value.to_be_bytes().to_vec());
     }
 
+    /// Encodes and stores the given Float32 value as the AVP data.
     pub fn set_float32(&mut self, value: f32) {
         self.data = Some(value.to_be_bytes().to_vec());
     }
 
+    /// Encodes and stores the given Float64 value as the AVP data.
     pub fn set_float64(&mut self, value: f64) {
         self.data = Some(value.to_be_bytes().to_vec());
     }
 
+    /// Decodes the AVP data as a Float32 value.
+    /// Returns `None` if the data is absent or not exactly 4 bytes.
     pub fn as_float32(&self) -> Option<f32> {
         if let Some(data) = self.data.as_ref() {
             if data.len() == 4 {
@@ -361,6 +451,8 @@ impl Avp {
         None
     }
 
+    /// Decodes the AVP data as a Float64 value.
+    /// Returns `None` if the data is absent or not exactly 8 bytes.
     pub fn as_float64(&self) -> Option<f64> {
         if let Some(data) = self.data.as_ref() {
             if data.len() == 8 {
@@ -372,14 +464,18 @@ impl Avp {
         None
     }
 
+    /// Stores the given byte vector as the raw AVP data.
     pub fn set_octet_string(&mut self, value: Vec<u8>) {
         self.data = Some(value);
     }
 
+    /// Returns the raw AVP data bytes, or an empty vector if absent.
     pub fn as_octet_string(&self) -> Vec<u8> {
         self.data.clone().unwrap_or_else(Vec::new)
     }
 
+    /// Decodes the AVP data as a UTF-8 string.
+    /// Returns `None` if the data is absent or not valid UTF-8.
     pub fn as_utf8_string(&self) -> Option<String> {
         if let Some(data) = self.data.as_ref() {
             if let Ok(s) = String::from_utf8(data.clone()) {
@@ -389,6 +485,9 @@ impl Avp {
         None
     }
 
+    /// Decodes the AVP data as a Diameter Address (RFC 6733 §4.3.1).
+    /// Supports IPv4 (address type 1) and IPv6 (address type 2).
+    /// Returns `None` if the format is unrecognised.
     pub fn as_address(&self) -> Option<String> {
         if let Some(data) = self.data.as_ref() {
             let n = data.len();
@@ -426,6 +525,8 @@ impl Avp {
         self.data = Some(value.as_bytes().to_vec());
     }
 
+    /// Decodes the AVP as a Grouped AVP, returning the contained sub-AVPs.
+    /// Returns `None` if the AVP is not a grouped type or cannot be decoded.
     pub fn as_grouped(&self) -> Option<Vec<Avp>> {
         if let Some(data) = self.data.as_ref() {
             if data.len() >= 8 {
@@ -450,13 +551,14 @@ impl Avp {
         None
     }
 
+    /// Replaces the AVP contents with the given sub-AVPs, converting this AVP into a grouped type.
     pub fn set_grouped(&mut self, sub_avps: Vec<Avp>) {
         self.data = None; // Clear data for grouped AVP
         self.sub_avps = sub_avps;
         self.flags |= 0x40; // Set the grouped flag
     }
 
-    // Calculate the total length of the AVP including header and data, accounting for vendor-specific AVPs
+    /// Returns the encoded byte length of this AVP (header + value, excluding padding).
     pub fn total_length(&self) -> u32 {
         match self.data.as_ref() {
             Some(data) => 8 + data.len() as u32 + if self.is_vendor_specific() { 4 } else { 0 },
@@ -481,6 +583,7 @@ impl Avp {
         }
     }
 
+    /// Encodes this AVP to its on-wire byte representation.
     pub fn encode(&self) -> Vec<u8> {
         let mut buffer = Vec::new();
         let length = self.total_length();
@@ -531,6 +634,11 @@ impl Avp {
         Some((code, flags, length, vendor_id))
     }
 
+    /// Decodes one AVP from the beginning of `data`.
+    ///
+    /// # Returns
+    /// * `Ok(Avp)` on success.
+    /// * `Err(String)` if the buffer is too short or malformed.
     pub fn decode(data: &[u8]) -> Result<Avp, String> {
         if let Some((code, flags, length, vendor_id)) = Self::decode_header(data) {
             if data.len() < length as usize {
@@ -565,6 +673,9 @@ impl std::fmt::Display for Avp {
     }
 }
 
+/// AVP descriptor loaded from a JSON/YAML dictionary file.
+///
+/// Used to look up AVPs by name and to drive encoding/decoding by name-value pairs.
 #[derive(Debug, Clone)]
 pub struct AvpJson {
     pub name: String,
@@ -575,6 +686,14 @@ pub struct AvpJson {
 }
 
 impl AvpJson {
+    /// Creates a new `AvpJson` descriptor.
+    ///
+    /// # Arguments
+    /// * `name` - Human-readable AVP name (e.g. `"Origin-Host"`).
+    /// * `code` - Numeric AVP code.
+    /// * `avp_type` - The data type used for encoding and decoding.
+    /// * `mandatory` - Whether the Mandatory flag should be set.
+    /// * `vendor_id` - Optional vendor ID for vendor-specific AVPs.
     pub fn new(
         name: String,
         code: u32,
@@ -593,7 +712,7 @@ impl AvpJson {
 }
 
 lazy_static::lazy_static! {
-    pub static ref STANDARD_AVP_JSON: Vec<AvpJson> = vec![
+    static ref STANDARD_AVP_JSON: Vec<AvpJson> = vec![
         AvpJson::new("Acct-Interim-Interval".to_string(), AvpCode::AcctInterimInterval as u32, AvpType::Unsigned32, true, None),
         AvpJson::new("Accounting-Realtime-Required".to_string(), AvpCode::AccountingRealtimeRequired as u32, AvpType::Enumerated, true, None),
         AvpJson::new("Acct-Multi-Session-Id".to_string(), AvpCode::AcctMultiSessionId as u32, AvpType::UTF8String, true, None),
@@ -645,7 +764,7 @@ lazy_static::lazy_static! {
         AvpJson::new("Vendor-Specific-Application-Id".to_string(), AvpCode::VendorSpecificApplicationId as u32, AvpType::Grouped, true, None),
     ];
 
-    pub static ref STANDARD_AVP_MAP: AvpMap = AvpMap::new(STANDARD_AVP_JSON.clone());
+    static ref STANDARD_AVP_MAP: AvpMap = AvpMap::new(STANDARD_AVP_JSON.clone());
 }
 
 #[derive(Debug, Clone)]
@@ -656,21 +775,23 @@ pub struct AvpMap {
 
 impl AvpMap {
     pub fn new(avps: Vec<AvpJson>) -> Self {
-        let mut code_to_avp = HashMap::new();
-        let mut name_to_avp = HashMap::new();
+        let mut avp_map = AvpMap {
+            code_to_avp: HashMap::new(),
+            name_to_avp: HashMap::new(),
+        };
 
         for avp in STANDARD_AVP_JSON.iter() {
-            code_to_avp.insert(avp.code, avp.clone());
-            name_to_avp.insert(avp.name.clone(), avp.clone());
+            avp_map.add_avp(avp.clone());
         }
         for avp in avps {
-            code_to_avp.insert(avp.code, avp.clone());
-            name_to_avp.insert(avp.name.clone(), avp);
+            avp_map.add_avp(avp);
         }
-        AvpMap {
-            code_to_avp,
-            name_to_avp,
-        }
+        avp_map
+    }
+
+    fn add_avp(&mut self, avp: AvpJson) {
+        self.code_to_avp.insert(avp.code, avp.clone());
+        self.name_to_avp.insert(avp.name.clone(), avp);
     }
 
     pub fn get_by_code(&self, code: u32) -> Option<&AvpJson> {
@@ -747,9 +868,10 @@ pub fn avp_to_name_value(avp: &Avp, avp_map: &AvpMap) -> Result<(String, Value),
     if let Some(named_avp) = avp_map.get_by_code(avp.code) {
         match named_avp.avp_type {
             AvpType::OctetString => {
-                if let Ok(value) = String::from_utf8(avp.data.clone().unwrap()) {
-                    return Ok((named_avp.name.clone(), value.into()));
-                }
+                return Ok((
+                    named_avp.name.clone(),
+                    Value::String(BASE64_STANDARD.encode(avp.data.clone().unwrap())),
+                ));
             }
             AvpType::Address => {
                 if let Some(value) = avp.as_address() {

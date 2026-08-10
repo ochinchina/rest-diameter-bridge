@@ -5,19 +5,30 @@ use crate::config::StackCapability;
 
 use serde_json::Value;
 
+/// Returns `true` if the file at `path` does not exist or has a size of zero.
 pub fn is_empty_file(path: &str) -> bool {
     std::fs::metadata(path)
         .map(|m| m.len() == 0)
         .unwrap_or(true)
 }
 
+/// Returns `true` if the file at `path` exists and has at least one byte.
 pub fn is_non_empty_file(path: &str) -> bool {
     std::fs::metadata(path)
         .map(|m| m.len() > 0)
         .unwrap_or(false)
 }
 
-pub fn creat_capability_avps(capability: &StackCapability, avp_map: &AvpMap) -> Vec<Avp> {
+/// Builds the AVP list for a Capabilities-Exchange-Request from a [`StackCapability`] configuration.
+///
+/// # Arguments
+/// * `capability` - The stack capability configuration describing the local Diameter node.
+/// * `avp_map` - The AVP dictionary used to resolve AVP names to codes and types.
+///
+/// # Returns
+/// A vector of AVPs representing the local node's capabilities (Vendor-Id, Product-Name,
+/// Host-IP-Address, Auth-Application-Id, Acct-Application-Id, etc.).
+pub fn create_capability_avps(capability: &StackCapability, avp_map: &AvpMap) -> Vec<Avp> {
     let mut avps = Vec::new();
     for host_ip in capability.host_ips.clone().unwrap_or_default() {
         let avp = Avp::from_utf8_string(

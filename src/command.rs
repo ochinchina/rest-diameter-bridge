@@ -1,14 +1,18 @@
 use crate::{
-    avp::{Avp, AvpCode, AvpFlags, AvpMap, avp_to_name_value, name_value_to_avp},
+    avp::{
+        Avp, AvpCode, AvpFlags, AvpMap, RedirectHostUsage, avp_to_name_value, name_value_to_avp,
+    },
     utils::is_empty_file,
 };
 use bytes::{BufMut, BytesMut};
 use log::{error, info};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use serde_yaml;
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Bit-flag constants for the Diameter command flags octet (RFC 6733 §3).
 pub enum CommandFlags {
     Request = 0x80,
     Proxiable = 0x40,
@@ -16,6 +20,74 @@ pub enum CommandFlags {
     PotentiallyRetransmitted = 0x10,
 }
 
+impl CommandFlags {
+    fn from_str(value: &str) -> Option<Vec<CommandFlags>> {
+        let flags = value.to_lowercase();
+        let flags = flags
+            .chars()
+            .map(|flag| match flag {
+                'r' => Some(CommandFlags::Request),
+                'p' => Some(CommandFlags::Proxiable),
+                'e' => Some(CommandFlags::Error),
+                't' => Some(CommandFlags::PotentiallyRetransmitted),
+                _ => None,
+            })
+            .filter(|f| f.is_some())
+            .map(|f| f.unwrap())
+            .collect::<Vec<CommandFlags>>();
+
+        return if flags.is_empty() {
+            None
+        } else {
+            return Some(flags);
+        };
+    }
+
+    fn str_from_u8(value: u8) -> String {
+        let mut result = vec![];
+
+        if value & 0x80 != 0 {
+            result.push("R");
+        }
+        if value & 0x40 != 0 {
+            result.push("P");
+        }
+        if value & 0x20 != 0 {
+            result.push("E");
+        }
+        if value & 0x10 != 0 {
+            result.push("T");
+        }
+        if result.is_empty() {
+            String::new()
+        } else {
+            result.join("")
+        }
+    }
+
+    pub fn u8_from_str(value: &str) -> Option<u8> {
+        let flags = value.to_lowercase();
+        let mut result: u8 = 0;
+
+        for flag in flags.chars() {
+            match flag {
+                'r' => result |= CommandFlags::Request as u8,
+                'p' => result |= CommandFlags::Proxiable as u8,
+                'e' => result |= CommandFlags::Error as u8,
+                't' => result |= CommandFlags::PotentiallyRetransmitted as u8,
+                _ => {}
+            }
+        }
+
+        if result == 0 { None } else { Some(result) }
+    }
+
+    fn as_u8(&self) -> u8 {
+        *self as u8
+    }
+}
+
+/// Standard Diameter command codes as defined in RFC 6733 and related specifications.
 pub enum CommandCode {
     CapabilitiesExchange = 257,
     ReAuth = 258,
@@ -25,35 +97,45 @@ pub enum CommandCode {
     DeviceWatchdog = 280,
     DisconnectPeer = 282,
 }
+/// An incremental byte buffer that accumulates raw TCP/SCTP data and yields complete
+/// [`Command`] frames as they arrive.
 pub struct CommandBuffer {
     buffer: BytesMut,
 }
 
 impl CommandBuffer {
+    /// Creates an empty `CommandBuffer`.
     pub fn new() -> Self {
         CommandBuffer {
             buffer: BytesMut::new(),
         }
     }
 
+    /// Creates a `CommandBuffer` pre-loaded with the given bytes.
     pub fn from_bytes(bytes: &[u8]) -> Self {
         CommandBuffer {
             buffer: BytesMut::from(bytes),
         }
     }
 
+    /// Appends `data` to the internal buffer.
     pub fn append(&mut self, data: &[u8]) {
         self.buffer.extend_from_slice(data);
     }
 
+    /// Clears all data from the buffer.
     pub fn clear(&mut self) {
         self.buffer.clear();
     }
 
+    /// Returns a slice of the raw buffered bytes.
     pub fn get(&self) -> &[u8] {
         &self.buffer
     }
 
+    /// Attempts to read and decode one complete Diameter command from the buffer.
+    /// The consumed bytes are removed from the buffer.
+    /// Returns `None` if there is insufficient data for a full command.
     pub fn read_command(&mut self) -> Option<Command> {
         if self.buffer.len() < 20 {
             return None; // Not enough data for Diameter header
@@ -79,6 +161,8 @@ impl CommandBuffer {
         }
     }
 
+    /// Reads and decodes all complete Diameter commands currently held in the buffer.
+    /// Each successfully decoded command is removed from the buffer.
     pub fn read_commands(&mut self) -> Vec<Command> {
         let mut commands = Vec::new();
         while let Some(cmd) = self.read_command() {
@@ -88,6 +172,7 @@ impl CommandBuffer {
     }
 }
 
+/// A decoded Diameter command (request or answer) as defined in RFC 6733 §3.
 #[derive(Debug, Clone)]
 pub struct Command {
     pub code: u32,
@@ -99,6 +184,15 @@ pub struct Command {
 }
 
 impl Command {
+    /// Creates a new `Command` with the specified header fields and AVP list.
+    ///
+    /// # Arguments
+    /// * `code` - The Diameter command code.
+    /// * `flags` - The command flags byte (use [`CommandFlags`] constants).
+    /// * `application_id` - The Diameter application identifier.
+    /// * `hop_by_hop_id` - Hop-by-Hop identifier used to match requests with answers.
+    /// * `end_to_end_id` - End-to-End identifier used for duplicate detection.
+    /// * `avps` - The list of AVPs carried by the command.
     pub fn new(
         code: u32,
         flags: u8,
@@ -117,6 +211,177 @@ impl Command {
         }
     }
 
+    // create diameter command from json, using command map and avp map to get names and values
+    pub fn from_json_str(
+        json: &str,
+        command_map: &CommandMap,
+        avp_map: &AvpMap,
+    ) -> Result<Command, String> {
+        let v: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        Self::from_json_value(&v, command_map, avp_map)
+    }
+
+    pub fn from_json_value(
+        v: &Value,
+        command_map: &CommandMap,
+        avp_map: &AvpMap,
+    ) -> Result<Command, String> {
+        match v.as_object() {
+            Some(obj) => {
+                let command_define = Self::get_command_define(obj, command_map);
+                if command_define.is_none() {
+                    return Err("Command not found in command map".to_string());
+                }
+                let command_define = command_define.unwrap();
+
+                let mut avps = Vec::new();
+                let mut application_id = command_define.application_id;
+                let mut hop_by_hop_id = 0;
+                let mut end_to_end_id = 0;
+                let mut flags = 0;
+
+                obj.iter().for_each(|(k, v)| match k.as_str() {
+                    "code" | "name" => {}
+                    "application_id" => {
+                        if let Some(app_id) = v.as_u64() {
+                            application_id = app_id as u32;
+                        }
+                    }
+                    "hop_by_hop_id" => {
+                        hop_by_hop_id = v.as_u64().unwrap_or(0) as u32;
+                    }
+                    "end_to_end_id" => {
+                        end_to_end_id = v.as_u64().unwrap_or(0) as u32;
+                    }
+                    "callback-url" => {}
+                    "flags" => {
+                        CommandFlags::from_str(v.as_str().unwrap_or_default())
+                            .unwrap_or_default()
+                            .iter()
+                            .for_each(|flag| {
+                                flags |= flag.as_u8();
+                            });
+                    }
+                    avp_name => {
+                        // If the value is an array, we need to create multiple AVPs with the same name
+                        if v.is_array() {
+                            v.as_array().unwrap().iter().for_each(|item| {
+                                if let Ok(avp) = name_value_to_avp(avp_name, item, avp_map) {
+                                    avps.push(avp);
+                                } else {
+                                    error!("Unknown AVP: {} with value {:?}", avp_name, item);
+                                }
+                            });
+                        } else {
+                            if let Ok(avp) = name_value_to_avp(avp_name, v, avp_map) {
+                                avps.push(avp);
+                            } else {
+                                error!("Unknown AVP: {} with value {:?}", avp_name, v);
+                            }
+                        }
+                    }
+                });
+
+                command_define.sort_avps(&mut avps, avp_map);
+
+                Ok(Command::new(
+                    command_define.code,
+                    command_define.flags() | flags,
+                    application_id,
+                    hop_by_hop_id,
+                    end_to_end_id,
+                    avps,
+                ))
+            }
+            None => return Err("Invalid JSON format".to_string()),
+        }
+    }
+
+    fn get_command_define(
+        obj: &Map<String, Value>,
+        command_map: &CommandMap,
+    ) -> Option<CommandJson> {
+        if let Some(code) = obj.get("code").and_then(|v| v.as_u64()) {
+            let request = obj.get("request").and_then(|v| v.as_bool()).unwrap_or(true);
+            command_map.get_by_code(code as u32, request)
+        } else if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
+            command_map.get_by_name(name)
+        } else {
+            None
+        }
+    }
+
+    // create json from diameter command, using command map and avp map to get names and values
+    pub fn to_json(&self, command_map: &CommandMap, avp_map: &AvpMap) -> Value {
+        let avps_json: Vec<(String, Value)> = self
+            .avps
+            .iter()
+            .map(|avp| {
+                let (name, value) = avp_to_name_value(avp, avp_map).unwrap_or_else(|_| {
+                    (
+                        format!("Unknown-AVP-{}", avp.code),
+                        Value::String("Unknown".to_string()),
+                    )
+                });
+                (name, value)
+            })
+            .collect();
+
+        let mut r = serde_json::json!({});
+
+        if let Some(command_define) = command_map.get_by_code(self.code, self.is_request()) {
+            r.as_object_mut().unwrap().insert(
+                "name".to_string(),
+                Value::String(command_define.long_name.clone()),
+            );
+        }
+
+        r.as_object_mut().unwrap().insert(
+            "code".to_string(),
+            Value::Number(serde_json::Number::from(self.code)),
+        );
+
+        r.as_object_mut().unwrap().insert(
+            "application_id".to_string(),
+            Value::Number(serde_json::Number::from(self.application_id)),
+        );
+
+        r.as_object_mut().unwrap().insert(
+            "hop_by_hop_id".to_string(),
+            Value::Number(serde_json::Number::from(self.hop_by_hop_id)),
+        );
+
+        r.as_object_mut().unwrap().insert(
+            "end_to_end_id".to_string(),
+            Value::Number(serde_json::Number::from(self.end_to_end_id)),
+        );
+
+        r.as_object_mut().unwrap().insert(
+            "flags".to_string(),
+            Value::String(CommandFlags::str_from_u8(self.flags)),
+        );
+
+        for (name, value) in avps_json {
+            if let Some(old_value) = r.as_object_mut().unwrap().get_mut(&name) {
+                if old_value.is_array() {
+                    old_value.as_array_mut().unwrap().push(value);
+                } else {
+                    *old_value = serde_json::json!([old_value.clone(), value]);
+                }
+            } else {
+                r.as_object_mut().unwrap().insert(name, value);
+            }
+        }
+        r
+    }
+
+    pub fn to_pretty_json_str(&self, command_map: &CommandMap, avp_map: &AvpMap) -> String {
+        let json_value = self.to_json(command_map, avp_map);
+        serde_json::to_string_pretty(&json_value).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Creates an answer command from this request, copying the header identifiers and
+    /// swapping Destination-Host/Realm into Origin-Host/Realm.
     pub fn create_response(&self) -> Command {
         let mut command = Command {
             code: self.code,
@@ -126,13 +391,6 @@ impl Command {
             end_to_end_id: self.end_to_end_id,
             avps: Vec::new(),
         };
-
-        if self.get_origin_host().is_some() {
-            command.set_destination_host(&self.get_origin_host().unwrap());
-        }
-        if self.get_origin_realm().is_some() {
-            command.set_destination_realm(&self.get_origin_realm().unwrap());
-        }
 
         if self.get_destination_host().is_some() {
             command.set_origin_host(&self.get_destination_host().unwrap());
@@ -144,44 +402,63 @@ impl Command {
         command
     }
 
+    /// Returns `true` if the Request bit is set in the command flags.
     pub fn is_request(&self) -> bool {
         self.flags & 0x80 != 0
     }
 
+    /// Returns `true` if this command is an answer (Request bit not set).
     pub fn is_answer(&self) -> bool {
         !self.is_request()
     }
 
+    /// Returns `true` if the Proxiable bit is set in the command flags.
     pub fn is_proxiable(&self) -> bool {
         self.flags & 0x40 != 0
     }
 
+    /// Returns `true` if the Error bit is set in the command flags.
     pub fn is_error(&self) -> bool {
         self.flags & 0x20 != 0
     }
 
+    /// Returns `true` if the Potentially Retransmitted bit is set in the command flags.
     pub fn is_retransmission(&self) -> bool {
         self.flags & 0x10 != 0
     }
 
+    /// Returns the command code.
     pub fn get_command_id(&self) -> u32 {
         self.code
     }
 
+    /// Returns the application identifier.
     pub fn get_application_id(&self) -> u32 {
         self.application_id
     }
 
+    /// Appends a single AVP to the end of the AVP list.
     pub fn add_avp(&mut self, avp: Avp) {
         self.avps.push(avp);
     }
 
+    /// Appends multiple AVPs to the end of the AVP list.
     pub fn add_avps(&mut self, avps: Vec<Avp>) {
         self.avps.extend(avps);
     }
 
+    /// Returns the first AVP whose code matches `code`, or `None` if not found.
     pub fn get_avp(&self, code: u32) -> Option<&Avp> {
         self.avps.iter().find(|avp| avp.code == code)
+    }
+
+    /// Returns a vector of references to all AVPs whose code matches `code`.
+    /// # Arguments
+    /// * `code` - The AVP code to search for.
+    /// # Returns
+    /// * `Vec<&Avp>` - A vector of references to matching AVPs. Empty if none found.
+    pub fn get_avps(&self, code: u32) -> Vec<&Avp> {
+        self.avps.iter().filter(|avp| avp.code == code).collect()
     }
 
     /**
@@ -191,6 +468,8 @@ impl Command {
         self.get_avp(268).and_then(|avp| avp.as_unsigned32())
     }
 
+    /// Sets the Result-Code AVP (code 268). If one already exists it is updated in-place;
+    /// otherwise a new Mandatory AVP is appended.
     pub fn set_result_code(&mut self, result_code: u32) {
         if let Some(avp) = self.avps.iter_mut().find(|avp| avp.code == 268) {
             avp.set_unsigned32(result_code);
@@ -217,6 +496,7 @@ impl Command {
         self.get_avp(264).and_then(|avp| avp.as_utf8_string())
     }
 
+    /// Sets the Origin-Host AVP (code 264). Updates an existing one or appends a new one.
     pub fn set_origin_host(&mut self, origin_host: &String) {
         if let Some(avp) = self.avps.iter_mut().find(|avp| avp.code == 264) {
             avp.set_utf8_string(origin_host);
@@ -236,6 +516,7 @@ impl Command {
         self.get_avp(296).and_then(|avp| avp.as_utf8_string())
     }
 
+    /// Sets the Origin-Realm AVP (code 296). Updates an existing one or appends a new one.
     pub fn set_origin_realm(&mut self, origin_realm: &String) {
         if let Some(avp) = self.avps.iter_mut().find(|avp| avp.code == 296) {
             avp.set_utf8_string(origin_realm);
@@ -256,6 +537,7 @@ impl Command {
         self.get_avp(293).and_then(|avp| avp.as_utf8_string())
     }
 
+    /// Sets the Destination-Host AVP (code 293). Updates an existing one or appends a new one.
     pub fn set_destination_host(&mut self, destination_host: &String) {
         if let Some(avp) = self.avps.iter_mut().find(|avp| avp.code == 293) {
             avp.set_utf8_string(destination_host);
@@ -275,6 +557,7 @@ impl Command {
         self.get_avp(283).and_then(|avp| avp.as_utf8_string())
     }
 
+    /// Sets the Destination-Realm AVP (code 283). Updates an existing one or appends a new one.
     pub fn set_destination_realm(&mut self, destination_realm: &String) {
         if let Some(avp) = self.avps.iter_mut().find(|avp| avp.code == 283) {
             avp.set_utf8_string(destination_realm);
@@ -288,6 +571,44 @@ impl Command {
         }
     }
 
+    pub fn add_record_route(&mut self, host: &str) {
+        self.avps.push(Avp::from_utf8_string(
+            AvpCode::RouteRecord as u32,
+            AvpFlags::Mandatory as u8,
+            None,
+            host,
+        ));
+    }
+
+    pub fn remove_record_route(&mut self, host: &str) {
+        self.avps.retain(|avp| {
+            !(avp.code == AvpCode::RouteRecord as u32
+                && avp.as_utf8_string().map_or(false, |s| s == host))
+        });
+    }
+
+    /// Returns `true` if any Route-Record AVP (code 282) matches `host`.
+    pub fn has_record_route(&self, host: &str) -> bool {
+        self.avps.iter().any(|avp| {
+            avp.code == AvpCode::RouteRecord as u32
+                && avp.as_utf8_string().map_or(false, |s| s == host)
+        })
+    }
+
+    pub fn get_redirect_hosts(&self) -> Option<Vec<String>> {
+        self.get_avps(AvpCode::RedirectHost as u32)
+            .iter()
+            .filter_map(|avp| avp.as_utf8_string())
+            .collect::<Vec<String>>()
+            .into()
+    }
+    pub fn get_redirect_host_usage(&self) -> Option<RedirectHostUsage> {
+        self.get_avp(AvpCode::RedirectHostUsage as u32)
+            .and_then(|avp| avp.as_unsigned32())
+            .and_then(RedirectHostUsage::from_u32)
+    }
+
+    /// Encodes this command to its on-wire byte representation.
     pub fn encode(&self) -> Vec<u8> {
         let length = 20
             + self
@@ -306,6 +627,11 @@ impl Command {
         buffer.to_vec()
     }
 
+    /// Decodes a Diameter command from the given byte slice.
+    ///
+    /// # Returns
+    /// * `Ok(Command)` on success.
+    /// * `Err(String)` if the data is too short or malformed.
     pub fn decode(data: &[u8]) -> Result<Self, String> {
         if data.len() < 20 {
             return Err("Data too short for Diameter header".to_string());
@@ -431,7 +757,7 @@ impl CommandJson {
 }
 
 lazy_static::lazy_static! {
-    pub static ref STANDARD_COMMANDS: Vec<CommandJson> = vec![
+    static ref STANDARD_COMMANDS: Vec<CommandJson> = vec![
         CommandJson::new(
             "Abort-Session-Request".to_string(),
             "ASR".to_string(),
@@ -708,12 +1034,12 @@ lazy_static::lazy_static! {
             "Proxy-Info".to_string(),],
         ),
     ];
-    pub static ref STANDARD_COMMAND_MAP: CommandMap = CommandMap::new(STANDARD_COMMANDS.clone());
+    static ref STANDARD_COMMAND_MAP: CommandMap = CommandMap::new(STANDARD_COMMANDS.clone());
 }
 
 #[derive(Debug, Clone)]
 pub struct CommandMap {
-    code_to_command: HashMap<u32, HashMap<bool, CommandJson>>,
+    code_to_command: HashMap<u32, Vec<CommandJson>>,
     name_to_command: HashMap<String, CommandJson>,
 }
 
@@ -723,9 +1049,11 @@ impl CommandMap {
             code_to_command: HashMap::new(),
             name_to_command: HashMap::new(),
         };
+
         for cmd in STANDARD_COMMANDS.iter() {
             command_map.add_command(cmd.clone());
         }
+
         for cmd in commands {
             command_map.add_command(cmd);
         }
@@ -737,24 +1065,25 @@ impl CommandMap {
         let entry = self
             .code_to_command
             .entry(cmd.code)
-            .or_insert_with(HashMap::new);
-        entry.insert(cmd.request, cmd.clone());
+            .or_insert_with(Vec::new);
+        entry.push(cmd.clone());
+
         self.name_to_command
             .insert(cmd.long_name.clone().to_lowercase(), cmd.clone());
         self.name_to_command
             .insert(cmd.short_name.clone().to_lowercase(), cmd);
     }
 
-    pub fn get_by_code(&self, code: u32, request: bool) -> Option<&CommandJson> {
+    pub fn get_by_code(&self, code: u32, request: bool) -> Option<CommandJson> {
         self.code_to_command
             .get(&code)
-            .and_then(|m| m.get(&request))
-        //.or_else(|| STANDARD_COMMAND_MAP.get_by_code(code, request))
+            .and_then(|m| m.iter().find(|cmd| cmd.request == request))
+            .cloned()
     }
 
-    pub fn get_by_name(&self, name: &str) -> Option<&CommandJson> {
+    pub fn get_by_name(&self, name: &str) -> Option<CommandJson> {
         let name = name.to_lowercase();
-        self.name_to_command.get(&name)
+        self.name_to_command.get(&name).cloned()
         //.or_else(|| STANDARD_COMMAND_MAP.get_by_name(&name))
     }
 }
@@ -817,162 +1146,4 @@ pub fn load_command_definition_from_yaml(
         error!("Invalid YAML format: expected a mapping at the top level");
         Err("Invalid YAML format: expected a mapping at the top level".to_string())
     }
-}
-
-pub fn create_command_from_json_value(
-    v: &Value,
-    command_map: &CommandMap,
-    avp_map: &AvpMap,
-) -> Result<Command, String> {
-    match v.as_object() {
-        Some(obj) => {
-            let mut command_define = obj.get("name").and_then(|v| v.as_str()).map(|name| {
-                return command_map.get_by_name(name).unwrap();
-            });
-
-            if command_define.is_none() {
-                command_define = obj.get("code").and_then(|v| v.as_u64()).map(|code| {
-                    let request = obj.get("request").and_then(|v| v.as_bool()).unwrap_or(true);
-                    return command_map.get_by_code(code as u32, request).unwrap();
-                });
-            }
-            if command_define.is_none() {
-                return Err("Command not found in command map".to_string());
-            }
-            let command_define = command_define.unwrap();
-
-            let mut avps = Vec::new();
-            let mut application_id = command_define.application_id;
-            let mut hop_by_hop_id = 0;
-            let mut end_to_end_id = 0;
-
-            obj.iter().for_each(|(k, v)| match k.as_str() {
-                "code" | "name" => {}
-                "application_id" => {
-                    if let Some(app_id) = v.as_u64() {
-                        application_id = app_id as u32;
-                    }
-                }
-                "hop_by_hop_id" => {
-                    hop_by_hop_id = v.as_u64().unwrap_or(0) as u32;
-                }
-                "end_to_end_id" => {
-                    end_to_end_id = v.as_u64().unwrap_or(0) as u32;
-                }
-                "callback-url" => {}
-                avp_name => {
-                    // If the value is an array, we need to create multiple AVPs with the same name
-                    if v.is_array() {
-                        v.as_array().unwrap().iter().for_each(|item| {
-                            if let Ok(avp) = name_value_to_avp(avp_name, item, avp_map) {
-                                avps.push(avp);
-                            } else {
-                                error!("Unknown AVP: {} with value {:?}", avp_name, item);
-                            }
-                        });
-                    } else {
-                        if let Ok(avp) = name_value_to_avp(avp_name, v, avp_map) {
-                            avps.push(avp);
-                        } else {
-                            error!("Unknown AVP: {} with value {:?}", avp_name, v);
-                        }
-                    }
-                }
-            });
-
-            command_define.sort_avps(&mut avps, avp_map);
-
-            Ok(Command::new(
-                command_define.code,
-                command_define.flags(),
-                application_id,
-                hop_by_hop_id,
-                end_to_end_id,
-                avps,
-            ))
-        }
-        None => return Err("Invalid JSON format".to_string()),
-    }
-}
-
-// create diameter command from json, using command map and avp map to get names and values
-pub fn create_command_from_json_str(
-    json: &str,
-    command_map: &CommandMap,
-    avp_map: &AvpMap,
-) -> Result<Command, String> {
-    let v: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
-    create_command_from_json_value(&v, command_map, avp_map)
-}
-
-// create json from diameter command, using command map and avp map to get names and values
-pub fn create_json_from_command(
-    command: &Command,
-    command_map: &CommandMap,
-    avp_map: &AvpMap,
-) -> Value {
-    let avps_json: Vec<(String, Value)> = command
-        .avps
-        .iter()
-        .map(|avp| {
-            let (name, value) = avp_to_name_value(avp, avp_map).unwrap_or_else(|_| {
-                (
-                    format!("Unknown-AVP-{}", avp.code),
-                    Value::String("Unknown".to_string()),
-                )
-            });
-            (name, value)
-        })
-        .collect();
-
-    let mut r = serde_json::json!({});
-
-    if let Some(command_define) = command_map.get_by_code(command.code, command.is_request()) {
-        r.as_object_mut().unwrap().insert(
-            "name".to_string(),
-            Value::String(command_define.long_name.clone()),
-        );
-    } else {
-        r.as_object_mut().unwrap().insert(
-            "code".to_string(),
-            Value::Number(serde_json::Number::from(command.code)),
-        );
-    }
-
-    r.as_object_mut().unwrap().insert(
-        "application_id".to_string(),
-        Value::Number(serde_json::Number::from(command.application_id)),
-    );
-
-    r.as_object_mut().unwrap().insert(
-        "hop_by_hop_id".to_string(),
-        Value::Number(serde_json::Number::from(command.hop_by_hop_id)),
-    );
-
-    r.as_object_mut().unwrap().insert(
-        "end_to_end_id".to_string(),
-        Value::Number(serde_json::Number::from(command.end_to_end_id)),
-    );
-
-    for (name, value) in avps_json {
-        if let Some(old_value) = r.as_object_mut().unwrap().get_mut(&name) {
-            if old_value.is_array() {
-                old_value.as_array_mut().unwrap().push(value);
-            } else {
-                *old_value = serde_json::json!([old_value.clone(), value]);
-            }
-        } else {
-            r.as_object_mut().unwrap().insert(name, value);
-        }
-    }
-    r
-}
-
-pub fn create_json_from_command_pretty(
-    command: &Command,
-    command_map: &CommandMap,
-    avp_map: &AvpMap,
-) -> String {
-    let json_value = create_json_from_command(command, command_map, avp_map);
-    serde_json::to_string_pretty(&json_value).unwrap_or_else(|_| "{}".to_string())
 }

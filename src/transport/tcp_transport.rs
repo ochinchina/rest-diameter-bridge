@@ -1,15 +1,12 @@
 use crate::alarm::AlarmSender;
-use crate::avp::{Avp, AvpCode, AvpFlags, AvpMap, ResultCode, STANDARD_AVP_MAP, name_value_to_avp};
-use crate::command::{
-    Command, CommandCode, CommandFlags, CommandMap, STANDARD_COMMAND_MAP,
-    create_json_from_command_pretty,
-};
+use crate::avp::{Avp, AvpCode, AvpFlags, AvpMap, ResultCode, name_value_to_avp};
+use crate::command::{Command, CommandCode, CommandFlags, CommandMap};
 use crate::config::StackCapability;
 use crate::transport::{
-    Connection, ConnectionManager, HopByHopIdMapper, IdGenerator, read_command,
-    replace_hop_by_hop_id,
+    AnswerManager, CommandHandler, CommandProcessorContext, Connection, ConnectionManager,
+    HopByHopIdMapper, IdGenerator, RedirectHostManager, read_command,
 };
-use crate::utils::{creat_capability_avps, is_empty_file};
+use crate::utils::{create_capability_avps, is_empty_file};
 use log::{debug, error, info};
 use serde_json::Value;
 use std::sync::Arc;
@@ -35,17 +32,19 @@ pub struct TcpClientConnection {
     key_file: String,
     cert_file: String,
     ca_cert_file: String,
-    cer_timeout: u64,
-    hop_by_hop_id_generator: Arc<IdGenerator>,
-    end_to_end_id_generator: Arc<IdGenerator>,
+    cer_timeout: Duration,
+    hop_by_hop_id_generator: Arc<Box<IdGenerator>>,
+    end_to_end_id_generator: Arc<Box<IdGenerator>>,
     command_map: CommandMap,
     avp_map: AvpMap,
     writer: Arc<Mutex<Option<BoxedWriter>>>,
-    connection_manager: Arc<Mutex<ConnectionManager>>,
+    connection_manager: Arc<Box<ConnectionManager>>,
     connected: Arc<std::sync::atomic::AtomicBool>,
-    hop_by_hop_id_mapper: Arc<HopByHopIdMapper>,
+    hop_by_hop_id_mapper: Arc<Box<HopByHopIdMapper>>,
+    answer_manager: Arc<Box<crate::transport::AnswerManager>>,
     command_handler: Arc<dyn crate::transport::CommandHandler + Send + Sync>,
     alarm_sender: Option<AlarmSender>,
+    redirect_host_manager: Arc<Box<RedirectHostManager>>,
 }
 
 impl TcpClientConnection {
@@ -59,13 +58,17 @@ impl TcpClientConnection {
         key_file: String,
         cert_file: String,
         ca_cert_file: String,
-        hop_by_hop_id_generator: Arc<IdGenerator>,
-        end_to_end_id_generator: Arc<IdGenerator>,
-        cer_timeout: u64,
-        connection_manager: Arc<Mutex<ConnectionManager>>,
-        hop_by_hop_id_mapper: Arc<HopByHopIdMapper>,
-        command_handler: Arc<dyn crate::transport::CommandHandler + Send + Sync>,
+        hop_by_hop_id_generator: Arc<Box<IdGenerator>>,
+        end_to_end_id_generator: Arc<Box<IdGenerator>>,
+        command_map: CommandMap,
+        avp_map: AvpMap,
+        cer_timeout: Duration,
+        connection_manager: Arc<Box<ConnectionManager>>,
+        hop_by_hop_id_mapper: Arc<Box<HopByHopIdMapper>>,
+        answer_manager: Arc<Box<AnswerManager>>,
+        command_handler: Arc<dyn CommandHandler + Send + Sync>,
         alarm_sender: Option<AlarmSender>,
+        redirect_host_manager: Arc<Box<RedirectHostManager>>,
     ) -> Self {
         TcpClientConnection {
             address,
@@ -80,14 +83,16 @@ impl TcpClientConnection {
             cer_timeout,
             hop_by_hop_id_generator,
             end_to_end_id_generator,
-            command_map: STANDARD_COMMAND_MAP.clone(),
-            avp_map: STANDARD_AVP_MAP.clone(),
+            command_map: command_map,
+            avp_map: avp_map,
             writer: Arc::new(Mutex::new(None)),
             connection_manager,
             connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hop_by_hop_id_mapper,
+            answer_manager,
             command_handler,
             alarm_sender,
+            redirect_host_manager,
         }
     }
 
@@ -209,8 +214,8 @@ impl TcpClientConnection {
                             }
 
                         }
-                        _ = tokio::time::sleep(Duration::from_secs(self.cer_timeout)) => {
-                            error!("CER timeout after {} seconds", self.cer_timeout);
+                        _ = tokio::time::sleep(self.cer_timeout) => {
+                            error!("CER timeout after {:?}", self.cer_timeout);
                             self.close().await.ok();
                             continue;
                         }
@@ -234,6 +239,7 @@ impl TcpClientConnection {
                             )
                             .await;
                     }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
         }
@@ -284,7 +290,7 @@ impl TcpClientConnection {
             .unwrap(),
         ];
 
-        avps.extend(creat_capability_avps(&self.capability, &self.avp_map));
+        avps.extend(create_capability_avps(&self.capability, &self.avp_map));
 
         let cer_command = Command::new(
             CommandCode::CapabilitiesExchange as u32,
@@ -296,7 +302,7 @@ impl TcpClientConnection {
         );
         info!(
             "Sending CER: {} to tcp server: {}",
-            create_json_from_command_pretty(&cer_command, &self.command_map, &self.avp_map),
+            cer_command.to_pretty_json_str(&self.command_map, &self.avp_map),
             self.address
         );
         self.send(&cer_command).await
@@ -347,7 +353,7 @@ impl TcpClientConnection {
         );
         info!(
             "Sending DWR: {} to tcp server: {}",
-            create_json_from_command_pretty(&dwr_command, &self.command_map, &self.avp_map),
+            dwr_command.to_pretty_json_str(&self.command_map, &self.avp_map),
             self.address
         );
         Self::send_command(self.writer.clone(), &dwr_command).await
@@ -377,7 +383,7 @@ impl TcpClientConnection {
         );
         info!(
             "Sending DWA: {} to tcp server: {}",
-            create_json_from_command_pretty(&dwa_command, &self.command_map, &self.avp_map),
+            dwa_command.to_pretty_json_str(&self.command_map, &self.avp_map),
             self.address
         );
         Self::send_command(self.writer.clone(), &dwa_command).await
@@ -412,7 +418,7 @@ impl TcpClientConnection {
         );
         info!(
             "Sending DPR: {} to tcp server: {}",
-            create_json_from_command_pretty(&dpr_command, &self.command_map, &self.avp_map),
+            dpr_command.to_pretty_json_str(&self.command_map, &self.avp_map),
             self.address
         );
         Self::send_command(self.writer.clone(), &dpr_command).await?;
@@ -453,7 +459,7 @@ impl TcpClientConnection {
                                     } else {
                                         "answer"
                                     },
-                                    create_json_from_command_pretty(&command, &self.command_map, &self.avp_map),
+                                    command.to_pretty_json_str(&self.command_map, &self.avp_map),
                                     address
                                 );
                                 match self.process_command(&mut command).await {
@@ -483,125 +489,31 @@ impl TcpClientConnection {
             } else {
                 info!("Received DWA response from server, connection is healthy");
             }
-        } else if command.code == CommandCode::DisconnectPeer as u32 && command.is_request() {
+            return Ok(());
+        }
+
+        if command.code == CommandCode::DisconnectPeer as u32 && command.is_request() {
             self.process_dpr(command).await?;
-        } else if self.is_my_origin_request(command) {
-            error!(
-                "Diameter loop detected for command with code {} and hop-by-hop ID {}. Sending error response.",
-                command.code, command.hop_by_hop_id
-            );
-            let mut response = command.create_response();
-            response.set_origin_host(&self.my_host);
-            response.set_origin_realm(&self.my_realm);
-            response.set_destination_host(&self.peer_host);
-            response.set_destination_realm(&self.peer_realm);
-            response.set_result_code(ResultCode::DiameterLoopDetected.as_u32());
-            self.connection_manager
-                .lock()
-                .await
-                .find_send_command(&response)
-                .await
-                .map_err(|e| format!("Failed to send response: {}", e))?;
-        } else if self.is_my_command(&command) {
-            info!(
-                "The {} with code {} is for this stack (my_host: {}, my_realm: {}), processing locally",
-                if command.is_request() {
-                    "request"
-                } else {
-                    "answer"
-                },
-                command.code,
-                self.my_host,
-                self.my_realm
-            );
-            match self.command_handler.handle_command(command).await {
-                Ok(Some(answer)) => {
-                    info!(
-                        "Generated answer for request with code {} and hop-by-hop ID {}: {}",
-                        command.code,
-                        command.hop_by_hop_id,
-                        create_json_from_command_pretty(&answer, &self.command_map, &self.avp_map)
-                    );
-                    self.connection_manager
-                        .lock()
-                        .await
-                        .find_send_command(&answer)
-                        .await
-                        .map_err(|e| format!("Failed to send answer: {}", e))?;
-                }
-                Ok(None) => {
-                    info!(
-                        "No answer generated for {} with code {} and hop-by-hop ID {}",
-                        if command.is_request() {
-                            "request"
-                        } else {
-                            "answer"
-                        },
-                        command.code,
-                        command.hop_by_hop_id
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to handle {} with code {} and hop-by-hop ID {}: {}",
-                        if command.is_request() {
-                            "request"
-                        } else {
-                            "answer"
-                        },
-                        command.code,
-                        command.hop_by_hop_id,
-                        e
-                    );
-                }
-            }
-        } else {
-            info!(
-                "The {} with code {} is not for this stack (my_host: {}, my_realm: {}), forwarding to connection manager",
-                if command.is_request() {
-                    "request"
-                } else {
-                    "answer"
-                },
-                command.code,
-                self.my_host,
-                self.my_realm
-            );
-
-            replace_hop_by_hop_id(command, &self.hop_by_hop_id_mapper);
-
-            let guard = self.connection_manager.lock().await;
-            match guard.find_send_command(&command).await {
-                Ok(_) => {
-                    info!(
-                        "Successfully sent command through connection manager to {}@{}",
-                        command.get_destination_host().unwrap_or_default(),
-                        command.get_destination_realm().unwrap_or_default()
-                    );
-                }
-                Err(e) => {
-                    error!("Failed to send command through connection manager: {}", e);
-                }
-            }
+            return Ok(());
         }
 
-        Ok(())
-    }
+        let context = CommandProcessorContext {
+            connection_id: &self.address,
+            my_host: &self.my_host,
+            my_realm: &self.my_realm,
+            peer_host: &self.peer_host,
+            peer_realm: &self.peer_realm,
+            command_map: &self.command_map,
+            avp_map: &self.avp_map,
+            connection_manager: &self.connection_manager,
+            hop_by_hop_id_generator: &self.hop_by_hop_id_generator,
+            hop_by_hop_id_mapper: &self.hop_by_hop_id_mapper,
+            answer_manager: &self.answer_manager,
+            command_handler: self.command_handler.as_ref(),
+            redirect_host_manager: &self.redirect_host_manager,
+        };
 
-    fn is_my_command(&self, command: &Command) -> bool {
-        let destination_host = command.get_destination_host().unwrap_or_default();
-        let destination_realm = command.get_destination_realm().unwrap_or_default();
-        return destination_host == self.my_host && destination_realm == self.my_realm;
-    }
-
-    fn is_my_origin_request(&self, command: &Command) -> bool {
-        if command.is_answer() {
-            return false;
-        }
-
-        let origin_host = command.get_origin_host().unwrap_or_default();
-        let origin_realm = command.get_origin_realm().unwrap_or_default();
-        return origin_host == self.my_host && origin_realm == self.my_realm;
+        context.process_command(command).await
     }
     async fn process_dpr(&self, command: &Command) -> Result<(), String> {
         info!(
@@ -681,6 +593,12 @@ impl Connection for TcpClientConnection {
         false
     }
 
+    async fn get_connections(
+        &self,
+        _connections: &mut Vec<Arc<Box<dyn Connection + Send + Sync>>>,
+    ) {
+    }
+
     fn get_peer_host(&self) -> Result<String, String> {
         Ok(self.peer_host.clone())
     }
@@ -701,9 +619,12 @@ pub struct TcpServerConnection {
     command_map: CommandMap,
     writer: Arc<Mutex<Option<BoxedWriter>>>,
     closed: Arc<std::sync::atomic::AtomicBool>,
-    hop_by_hop_id_mapper: Arc<HopByHopIdMapper>,
-    command_handler: Arc<dyn crate::transport::CommandHandler + Send + Sync>,
+    hop_by_hop_id_generator: Arc<Box<IdGenerator>>,
+    hop_by_hop_id_mapper: Arc<Box<HopByHopIdMapper>>,
+    answer_manager: Arc<Box<AnswerManager>>,
+    command_handler: Arc<dyn CommandHandler + Send + Sync>,
     alarm_sender: Option<AlarmSender>,
+    redirect_host_manager: Arc<Box<RedirectHostManager>>,
 }
 
 impl TcpServerConnection {
@@ -717,64 +638,53 @@ impl TcpServerConnection {
         peer_realm: String,
         command_map: CommandMap,
         avp_map: AvpMap,
-        connection_manager: Arc<Mutex<ConnectionManager>>,
-        hop_by_hop_id_mapper: Arc<HopByHopIdMapper>,
-        command_handler: Arc<dyn crate::transport::CommandHandler + Send + Sync>,
+        connection_manager: Arc<Box<ConnectionManager>>,
+        hop_by_hop_id_generator: Arc<Box<IdGenerator>>,
+        hop_by_hop_id_mapper: Arc<Box<HopByHopIdMapper>>,
+        answer_manager: Arc<Box<AnswerManager>>,
+        command_handler: Arc<dyn CommandHandler + Send + Sync>,
         alarm_sender: Option<AlarmSender>,
+        redirect_host_manager: Arc<Box<RedirectHostManager>>,
     ) -> Self {
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let conn = TcpServerConnection {
-            id: peer_addr.clone(),
-            my_host: my_host.clone(),
-            my_realm: my_realm.clone(),
-            peer_host: peer_host.clone(),
-            peer_realm: peer_realm.clone(),
-            avp_map: avp_map.clone(),
-            command_map: command_map.clone(),
+            id: peer_addr,
+            my_host: my_host,
+            my_realm: my_realm,
+            peer_host: peer_host,
+            peer_realm: peer_realm,
+            avp_map: avp_map,
+            command_map: command_map,
             writer: Arc::new(Mutex::new(Some(writer))),
-            closed: closed.clone(),
-            hop_by_hop_id_mapper: hop_by_hop_id_mapper.clone(),
-            command_handler: command_handler.clone(),
-            alarm_sender: alarm_sender.clone(),
+            closed: closed,
+            hop_by_hop_id_generator: hop_by_hop_id_generator,
+            hop_by_hop_id_mapper: hop_by_hop_id_mapper,
+            answer_manager: answer_manager,
+            command_handler: command_handler,
+            alarm_sender: alarm_sender,
+            redirect_host_manager: redirect_host_manager,
         };
 
         let mut conn_clone = conn.clone();
 
         tokio::spawn(async move {
             connection_manager
-                .lock()
-                .await
                 .add_connection(Arc::new(Box::new(conn_clone.clone())))
                 .await;
-            if let Some(alarm_sender) = &conn_clone.alarm_sender {
-                alarm_sender
-                    .clear_alarm(
-                        &conn_clone.id,
-                        &conn_clone.peer_host,
-                        &conn_clone.peer_realm,
-                    )
-                    .await;
-            }
+            conn_clone.clear_alarm().await;
+
             conn_clone
                 .handle_connection(reader, connection_manager.clone())
                 .await
                 .ok();
-            if let Some(alarm_sender) = &conn_clone.alarm_sender {
-                alarm_sender
-                    .raise_alarm(
-                        &conn_clone.id,
-                        &conn_clone.peer_host,
-                        &conn_clone.peer_realm,
-                        &format!(
-                            "Lost connection from diameter peer {}@{} at {}",
-                            conn_clone.peer_host, conn_clone.peer_realm, conn_clone.id
-                        ),
-                    )
-                    .await;
-            }
+
+            let alarm_raise_message = format!(
+                "Lost connection from diameter peer {}@{} at {}",
+                conn_clone.peer_host, conn_clone.peer_realm, conn_clone.id
+            );
+            conn_clone.raise_alarm(&alarm_raise_message).await;
+
             connection_manager
-                .lock()
-                .await
                 .remove_connection_by_id(&conn_clone.get_id())
                 .await;
         });
@@ -782,10 +692,25 @@ impl TcpServerConnection {
         conn
     }
 
+    async fn raise_alarm(&self, message: &str) {
+        if let Some(alarm_sender) = &self.alarm_sender {
+            alarm_sender
+                .raise_alarm(&self.id, &self.peer_host, &self.peer_realm, message)
+                .await;
+        }
+    }
+
+    async fn clear_alarm(&self) {
+        if let Some(alarm_sender) = &self.alarm_sender {
+            alarm_sender
+                .clear_alarm(&self.id, &self.peer_host, &self.peer_realm)
+                .await;
+        }
+    }
     async fn handle_connection(
         &mut self,
         mut reader: BoxedReader,
-        connection_manager: Arc<Mutex<ConnectionManager>>,
+        connection_manager: Arc<Box<ConnectionManager>>,
     ) -> Result<(), String> {
         let mut buffer = [0; 1024];
         let mut command_buffer = crate::command::CommandBuffer::new();
@@ -822,7 +747,7 @@ impl TcpServerConnection {
     async fn process_command(
         &mut self,
         command: &mut Command,
-        connection_manager: &Arc<Mutex<ConnectionManager>>,
+        connection_manager: &Arc<Box<ConnectionManager>>,
     ) -> Result<(), String> {
         // Implement command processing logic here
         info!(
@@ -832,126 +757,36 @@ impl TcpServerConnection {
             } else {
                 "answer"
             },
-            create_json_from_command_pretty(&command, &self.command_map, &self.avp_map),
+            command.to_pretty_json_str(&self.command_map, &self.avp_map),
             self.id
         );
         if command.code == CommandCode::DeviceWatchdog as u32 && command.is_request() {
             self.process_dwa(command).await?;
-        } else if command.code == CommandCode::DisconnectPeer as u32 && command.is_request() {
-            self.process_dpr(command).await?;
-        } else if self.is_my_command(command) {
-            if command.get_result_code() == Some(ResultCode::DiameterLoopDetected as u32) {
-                error!(
-                    "Diameter loop detected for command with code {} and hop-by-hop ID {}. Ignoring.",
-                    command.code, command.hop_by_hop_id
-                );
-                return Ok(());
-            }
-
-            info!(
-                "The {} with code {} is for this stack (my_host: {}, my_realm: {}), processing locally",
-                if command.is_request() {
-                    "request"
-                } else {
-                    "answer"
-                },
-                command.code,
-                self.my_host,
-                self.my_realm
-            );
-            match self.command_handler.handle_command(command).await {
-                Ok(Some(answer)) => {
-                    info!(
-                        "Generated answer for request with code {} and hop-by-hop ID {}: {}",
-                        command.code,
-                        command.hop_by_hop_id,
-                        create_json_from_command_pretty(&answer, &self.command_map, &self.avp_map)
-                    );
-                    connection_manager
-                        .lock()
-                        .await
-                        .find_send_command(&answer)
-                        .await
-                        .map_err(|e| format!("Failed to send answer: {}", e))?;
-                }
-                Ok(None) => {
-                    info!(
-                        "No answer generated for {} with code {} and hop-by-hop ID {}",
-                        if command.is_request() {
-                            "request"
-                        } else {
-                            "answer"
-                        },
-                        command.code,
-                        command.hop_by_hop_id
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to handle {} with code {} and hop-by-hop ID {}: {}",
-                        if command.is_request() {
-                            "request"
-                        } else {
-                            "answer"
-                        },
-                        command.code,
-                        command.hop_by_hop_id,
-                        e
-                    );
-                }
-            }
-        } else {
-            return self.forward_command(command, connection_manager).await;
+            return Ok(());
         }
-        Err("Command is not for this stack".to_string())
-    }
 
-    async fn forward_command(
-        &mut self,
-        command: &mut Command,
-        connection_manager: &Arc<Mutex<ConnectionManager>>,
-    ) -> Result<(), String> {
-        info!(
-            "The {} with code {} is not for this stack (my_host: {}, my_realm: {}), forwarding to connection manager",
-            if command.is_request() {
-                "request"
-            } else {
-                "answer"
-            },
-            command.code,
-            self.my_host,
-            self.my_realm
-        );
+        if command.code == CommandCode::DisconnectPeer as u32 && command.is_request() {
+            self.process_dpr(command).await?;
+            return Ok(());
+        }
 
-        replace_hop_by_hop_id(command, &self.hop_by_hop_id_mapper);
-        let guard = connection_manager.lock().await;
+        let context = CommandProcessorContext {
+            connection_id: &self.id,
+            my_host: &self.my_host,
+            my_realm: &self.my_realm,
+            peer_host: &self.peer_host,
+            peer_realm: &self.peer_realm,
+            command_map: &self.command_map,
+            avp_map: &self.avp_map,
+            connection_manager,
+            hop_by_hop_id_generator: &self.hop_by_hop_id_generator,
+            hop_by_hop_id_mapper: &self.hop_by_hop_id_mapper,
+            answer_manager: &self.answer_manager,
+            command_handler: self.command_handler.as_ref(),
+            redirect_host_manager: &self.redirect_host_manager,
+        };
 
-        match guard.find_send_command(command).await {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                if command.is_request() {
-                    let mut answer = command.create_response();
-                    answer.set_origin_host(&self.my_host);
-                    answer.set_origin_realm(&self.my_realm);
-                    answer.set_result_code(ResultCode::DiameterUnableToDeliver.as_u32());
-                    replace_hop_by_hop_id(&mut answer, &self.hop_by_hop_id_mapper);
-                    if let Err(e) = guard.find_send_command(&answer).await {
-                        error!("Failed to send error response: {}", e);
-                    }
-                }
-                Err(format!(
-                    "Failed to send command through connection manager: {}",
-                    e
-                ))
-            }
-        }?;
-        Ok(())
-    }
-
-    fn is_my_command(&self, command: &Command) -> bool {
-        let destination_host = command.get_destination_host().unwrap_or_default();
-        let destination_realm = command.get_destination_realm().unwrap_or_default();
-        return destination_host == self.my_host && destination_realm == self.my_realm;
+        context.process_command(command).await
     }
 
     async fn process_dwa(&mut self, command: &Command) -> Result<(), String> {
@@ -984,7 +819,7 @@ impl TcpServerConnection {
         );
         info!(
             "Sending DWA: {} to tcp client: {}",
-            create_json_from_command_pretty(&dwa, &self.command_map, &self.avp_map),
+            dwa.to_pretty_json_str(&self.command_map, &self.avp_map),
             self.id
         );
         self.send(&dwa).await
@@ -1020,7 +855,7 @@ impl TcpServerConnection {
         );
         info!(
             "Sending DPR: {} to tcp client: {}",
-            create_json_from_command_pretty(&dpr, &self.command_map, &self.avp_map),
+            dpr.to_pretty_json_str(&self.command_map, &self.avp_map),
             self.id
         );
         self.send(&dpr).await?;
@@ -1040,7 +875,7 @@ impl Connection for TcpServerConnection {
             command.code,
             command.hop_by_hop_id,
             format!("{}@{}", self.peer_host, self.peer_realm),
-            create_json_from_command_pretty(command, &self.command_map, &self.avp_map)
+            command.to_pretty_json_str(&self.command_map, &self.avp_map),
         );
         let data = command.encode();
         let mut guard = self.writer.lock().await;
@@ -1070,6 +905,12 @@ impl Connection for TcpServerConnection {
         self.closed.load(Ordering::Relaxed)
     }
 
+    async fn get_connections(
+        &self,
+        _connections: &mut Vec<Arc<Box<dyn Connection + Send + Sync>>>,
+    ) {
+    }
+
     fn get_peer_host(&self) -> Result<String, String> {
         Ok(self.peer_host.clone())
     }
@@ -1079,6 +920,7 @@ impl Connection for TcpServerConnection {
     }
 }
 
+#[derive(Clone)]
 pub struct TcpDiameterServer {
     host: String,
     realm: String,
@@ -1087,12 +929,15 @@ pub struct TcpDiameterServer {
     cert_file: String,
     ca_cert_file: String,
     address: String,
-    manager: Arc<Mutex<ConnectionManager>>,
+    manager: Arc<Box<ConnectionManager>>,
     command_map: CommandMap,
     avp_map: AvpMap,
-    hop_by_hop_id_mapper: Arc<HopByHopIdMapper>,
-    command_handler: Arc<dyn crate::transport::CommandHandler + Send + Sync>,
+    hop_by_hop_id_generator: Arc<Box<IdGenerator>>,
+    hop_by_hop_id_mapper: Arc<Box<HopByHopIdMapper>>,
+    answer_manager: Arc<Box<AnswerManager>>,
+    command_handler: Arc<dyn CommandHandler + Send + Sync>,
     alarm_sender: Option<AlarmSender>,
+    redirect_host_manager: Arc<Box<RedirectHostManager>>,
 }
 
 impl TcpDiameterServer {
@@ -1104,12 +949,15 @@ impl TcpDiameterServer {
         cert_file: String,
         ca_cert_file: String,
         address: String,
-        manager: Arc<Mutex<ConnectionManager>>,
+        manager: Arc<Box<ConnectionManager>>,
         command_map: CommandMap,
         avp_map: AvpMap,
-        hop_by_hop_id_mapper: Arc<HopByHopIdMapper>,
+        hop_by_hop_id_generator: Arc<Box<IdGenerator>>,
+        hop_by_hop_id_mapper: Arc<Box<HopByHopIdMapper>>,
+        answer_manager: Arc<Box<AnswerManager>>,
         command_handler: Arc<dyn crate::transport::CommandHandler + Send + Sync>,
         alarm_sender: Option<AlarmSender>,
+        redirect_host_manager: Arc<Box<RedirectHostManager>>,
     ) -> Self {
         TcpDiameterServer {
             host,
@@ -1122,9 +970,12 @@ impl TcpDiameterServer {
             manager,
             command_map,
             avp_map,
+            hop_by_hop_id_generator,
             hop_by_hop_id_mapper,
+            answer_manager,
             command_handler,
             alarm_sender,
+            redirect_host_manager,
         }
     }
 
@@ -1215,18 +1066,9 @@ impl TcpDiameterServer {
                     info!("Accepted connection from {}", addr);
                     let peer_addr = addr.to_string();
 
-                    let command_map = self.command_map.clone();
-                    let avp_map = self.avp_map.clone();
-                    let capability = self.capability.clone();
-                    let hop_by_hop_id_mapper = self.hop_by_hop_id_mapper.clone();
-                    let command_handler = self.command_handler.clone();
-                    let alarm_sender = self.alarm_sender.clone();
-
                     if let Some(ref acceptor) = tls_acceptor {
                         let acceptor = acceptor.clone();
-                        let manager = self.manager.clone();
-                        let host = self.host.clone();
-                        let realm = self.realm.clone();
+                        let self_clone = self.clone();
 
                         tokio::spawn(async move {
                             match acceptor.accept(stream).await {
@@ -1236,31 +1078,19 @@ impl TcpDiameterServer {
                                     let mut reader: BoxedReader = Box::new(reader);
                                     let mut writer: BoxedWriter = Box::new(writer);
 
-                                    if let Ok(cer) = Self::handle_connection(
-                                        host.clone(),
-                                        realm.clone(),
-                                        peer_addr.clone(),
-                                        &mut reader,
-                                        &mut writer,
-                                        &avp_map,
-                                        &command_map,
-                                        &capability,
-                                    )
-                                    .await
+                                    if let Ok(cer) = self_clone
+                                        .handle_connection(
+                                            peer_addr.clone(),
+                                            &mut reader,
+                                            &mut writer,
+                                        )
+                                        .await
                                     {
-                                        _ = Self::create_connection_from_cer(
-                                            host.clone(),
-                                            realm.clone(),
+                                        _ = self_clone.create_connection_from_cer(
                                             &cer,
                                             peer_addr.clone(),
                                             reader,
                                             writer,
-                                            &command_map,
-                                            &avp_map,
-                                            manager.clone(),
-                                            hop_by_hop_id_mapper.clone(),
-                                            command_handler.clone(),
-                                            alarm_sender.clone(),
                                         );
                                     } else {
                                         error!(
@@ -1279,34 +1109,16 @@ impl TcpDiameterServer {
                         let (reader, writer) = stream.into_split();
                         let mut reader: BoxedReader = Box::new(reader);
                         let mut writer: BoxedWriter = Box::new(writer);
-                        let host = self.host.clone();
-                        let realm = self.realm.clone();
 
-                        if let Ok(cer_command) = Self::handle_connection(
-                            host.clone(),
-                            realm.clone(),
-                            peer_addr.clone(),
-                            &mut reader,
-                            &mut writer,
-                            &avp_map,
-                            &command_map,
-                            &capability,
-                        )
-                        .await
+                        if let Ok(cer_command) = self
+                            .handle_connection(peer_addr.clone(), &mut reader, &mut writer)
+                            .await
                         {
-                            _ = Self::create_connection_from_cer(
-                                host.clone(),
-                                realm.clone(),
+                            _ = self.create_connection_from_cer(
                                 &cer_command,
                                 peer_addr.clone(),
                                 reader,
                                 writer,
-                                &self.command_map,
-                                &self.avp_map,
-                                self.manager.clone(),
-                                hop_by_hop_id_mapper.clone(),
-                                self.command_handler.clone(),
-                                alarm_sender.clone(),
                             );
                         } else {
                             error!("Failed to complete CER exchange with {}", peer_addr);
@@ -1323,18 +1135,11 @@ impl TcpDiameterServer {
     }
 
     fn create_connection_from_cer(
-        my_host: String,
-        my_realm: String,
+        &self,
         cer_command: &Command,
         peer_address: String,
         reader: BoxedReader,
         writer: BoxedWriter,
-        command_map: &CommandMap,
-        avp_map: &AvpMap,
-        manager: Arc<Mutex<ConnectionManager>>,
-        hop_by_hop_id_mapper: Arc<HopByHopIdMapper>,
-        command_handler: Arc<dyn crate::transport::CommandHandler + Send + Sync>,
-        alarm_sender: Option<AlarmSender>,
     ) -> TcpServerConnection {
         // Implement creating a TcpServerConnection from the accepted stream
 
@@ -1342,28 +1147,27 @@ impl TcpDiameterServer {
             peer_address,
             reader,
             writer,
-            my_host,
-            my_realm,
+            self.host.clone(),
+            self.realm.clone(),
             cer_command.get_origin_host().unwrap_or_default(),
             cer_command.get_origin_realm().unwrap_or_default(),
-            command_map.clone(),
-            avp_map.clone(),
-            manager.clone(),
-            hop_by_hop_id_mapper.clone(),
-            command_handler.clone(),
-            alarm_sender,
+            self.command_map.clone(),
+            self.avp_map.clone(),
+            self.manager.clone(),
+            self.hop_by_hop_id_generator.clone(),
+            self.hop_by_hop_id_mapper.clone(),
+            self.answer_manager.clone(),
+            self.command_handler.clone(),
+            self.alarm_sender.clone(),
+            self.redirect_host_manager.clone(),
         )
     }
 
     async fn handle_connection(
-        host: String,
-        realm: String,
+        &self,
         peer_address: String,
         reader: &mut BoxedReader,
         writer: &mut BoxedWriter,
-        avp_map: &AvpMap,
-        command_map: &CommandMap,
-        capability: &StackCapability,
     ) -> Result<Command, String> {
         let cer = match read_command(reader).await {
             Ok(cmd) => cmd,
@@ -1382,7 +1186,7 @@ impl TcpDiameterServer {
             } else {
                 "answer"
             },
-            create_json_from_command_pretty(&cer, command_map, avp_map),
+            cer.to_pretty_json_str(&self.command_map, &self.avp_map),
             peer_address
         );
         if cer.code != CommandCode::CapabilitiesExchange as u32 || !cer.is_request() {
@@ -1411,7 +1215,7 @@ impl TcpDiameterServer {
             ));
         }
 
-        let cea = Self::create_cea(host.clone(), realm.clone(), &cer, avp_map, capability);
+        let cea = self.create_cea(&cer);
         writer
             .write_all(&cea.encode())
             .await
@@ -1420,13 +1224,7 @@ impl TcpDiameterServer {
         return Ok(cer);
     }
 
-    fn create_cea(
-        host: String,
-        realm: String,
-        cer_command: &Command,
-        avp_map: &AvpMap,
-        capability: &StackCapability,
-    ) -> Command {
+    fn create_cea(&self, cer_command: &Command) -> Command {
         let mut cea = Command::new(
             CommandCode::CapabilitiesExchange as u32,
             CommandFlags::Proxiable as u8,
@@ -1434,13 +1232,23 @@ impl TcpDiameterServer {
             cer_command.hop_by_hop_id,
             cer_command.end_to_end_id,
             vec![
-                name_value_to_avp("Origin-Host", &Value::String(host), avp_map).unwrap(),
-                name_value_to_avp("Origin-Realm", &Value::String(realm), avp_map).unwrap(),
-                name_value_to_avp("Vendor-Id", &Value::Number(0.into()), avp_map).unwrap(),
+                name_value_to_avp(
+                    "Origin-Host",
+                    &Value::String(self.host.clone()),
+                    &self.avp_map,
+                )
+                .unwrap(),
+                name_value_to_avp(
+                    "Origin-Realm",
+                    &Value::String(self.realm.clone()),
+                    &self.avp_map,
+                )
+                .unwrap(),
+                name_value_to_avp("Vendor-Id", &Value::Number(0.into()), &self.avp_map).unwrap(),
             ],
         );
-        cea.add_avps(creat_capability_avps(capability, avp_map));
-        cea.set_result_code(2001); // Success
+        cea.add_avps(create_capability_avps(&self.capability, &self.avp_map));
+        cea.set_result_code(ResultCode::DiameterSuccess.as_u32()); // Success
         cea
     }
 }
