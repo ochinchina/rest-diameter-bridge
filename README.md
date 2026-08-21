@@ -84,7 +84,7 @@ stacks:
   # Timeouts (milliseconds)
   request-timeout: 10000
   connection-request-timeout: 5000
-  cer-timeout: 5
+  cer-timeout: 5000
 
   # AVP and command definition files
   avp-files: ["avps.yaml"]
@@ -108,8 +108,15 @@ stacks:
   # Diameter capabilities exchanged during CER/CEA
   capability:
     vendor-id: 10415
+    host-ips: ["127.0.0.1"]
     product-name: "Gateway-A"
     auth-application-ids: [16777217]
+    inband-security-ids: [0]
+    firmware-revision: 1
+    vendor-specific-application-ids:
+    - vendor-id: 10415
+      auth-application-id: 16777217
+      acct-application-id: 16777217
 ```
 
 **Configuration field explanation:**
@@ -148,7 +155,7 @@ stacks:
 
   request-timeout: 10000
   connection-request-timeout: 5000
-  cer-timeout: 5
+  cer-timeout: 5000
 
   avp-files: ["avps.yaml"]
   command-files: ["commands.yaml"]
@@ -173,8 +180,15 @@ stacks:
 
   capability:
     vendor-id: 10415
+    host-ips: ["127.0.0.1"]
     product-name: "Gateway-B"
     auth-application-ids: [16777217]
+    inband-security-ids: [0]
+    firmware-revision: 1
+    vendor-specific-application-ids:
+    - vendor-id: 10415
+      auth-application-id: 16777217
+      acct-application-id: 16777217
 ```
 
 **Additional fields:**
@@ -200,7 +214,7 @@ stacks:
 
   request-timeout: 10000
   connection-request-timeout: 5000
-  cer-timeout: 5
+  cer-timeout: 5000
 
   avp-files: ["avps.yaml"]
   command-files: ["commands.yaml"]
@@ -218,8 +232,15 @@ stacks:
 
   capability:
     vendor-id: 10415
+    host-ips: ["127.0.0.1"]
     product-name: "Gateway-C"
     auth-application-ids: [16777217]
+    inband-security-ids: [0]
+    firmware-revision: 1
+    vendor-specific-application-ids:
+    - vendor-id: 10415
+      auth-application-id: 16777217
+      acct-application-id: 16777217
 ```
 
 **Additional fields:**

@@ -1,0 +1,41 @@
+stacks:
+- name: gateway-b
+  realm: gateway-b.example.com
+  host: gateway-b
+
+  request-timeout: 10000
+  connection-request-timeout: 5000
+  cer-timeout: 5000
+
+  avp-files: ["avps.yaml"]
+  command-files: ["commands.yaml"]
+
+  # Listen for incoming Diameter connections from Gateway A
+  listen:
+  - address: "tcp://127.0.0.1:3868"
+
+  # Connect to Gateway C as a Diameter peer
+  peers:
+  - host: gateway-c@gateway-c.example.com
+    connection-url: "tcp://127.0.0.1:3869"
+
+  # Route messages destined for gateway-c.example.com realm to Gateway C
+  routing:
+    policy: "REALM"
+    default: gateway-c@gateway-c.example.com
+    items:
+    - host-realms:
+      - gateway-c.example.com
+      route: gateway-c@gateway-c.example.com
+
+  capability:
+    vendor-id: 10415
+    host-ips: ["127.0.0.1"]
+    product-name: "Gateway-B"
+    auth-application-ids: [16777217]
+    inband-security-ids: [0]
+    firmware-revision: 1
+    vendor-specific-application-ids:
+    - vendor-id: 10415
+      auth-application-id: 16777217
+      acct-application-id: 16777217

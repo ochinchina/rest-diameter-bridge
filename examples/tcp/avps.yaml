@@ -1,0 +1,71 @@
+avps:
+# --- 3GPP Sh Interface AVPs (TS 29.329) ---
+- name: "User-Data"
+  code: 702
+  type: "OctetString"
+  mandatory: true
+  vendor_id: 10415
+  vendor_specific: true
+
+- name: "Data-Reference"
+  code: 703
+  type: "Enumerated"
+  mandatory: true
+  vendor_id: 10415
+  vendor_specific: true
+
+- name: "Service-Indication"
+  code: 704
+  type: "OctetString"
+  mandatory: true
+  vendor_id: 10415
+  vendor_specific: true
+
+- name: "Subs-Req-Type"
+  code: 705
+  type: "Enumerated"
+  mandatory: true
+  vendor_id: 10415
+  vendor_specific: true
+
+- name: "Requested-Domain"
+  code: 706
+  type: "Enumerated"
+  mandatory: true
+  vendor_id: 10415
+  vendor_specific: true
+
+- name: "Current-Location"
+  code: 707
+  type: "Enumerated"
+  mandatory: true
+  vendor_id: 10415
+  vendor_specific: true
+
+- name: "MSISDN"
+  code: 701
+  type: "OctetString"
+  mandatory: true
+  vendor_id: 10415
+  vendor_specific: true
+
+- name: "Server-Name"
+  code: 602
+  type: "UTF8String"
+  mandatory: true
+  vendor_id: 10415
+  vendor_specific: true
+
+- name: "Wildcarded-Public-Identity"
+  code: 634
+  type: "UTF8String"
+  mandatory: false
+  vendor_id: 10415
+  vendor_specific: true
+
+- name: "DSA-Flags"
+  code: 710
+  type: "Unsigned32"
+  mandatory: false
+  vendor_id: 10415
+  vendor_specific: true

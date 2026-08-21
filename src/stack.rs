@@ -201,6 +201,28 @@ impl ListenAddress {
             parameters: parameters,
         })
     }
+
+    pub fn get_parameter(&self, key: &str) -> Option<&String> {
+        self.parameters.as_ref().and_then(|params| params.get(key))
+    }
+
+    pub fn get_parameter_bool(&self, key: &str) -> Option<bool> {
+        self.parameters
+            .as_ref()
+            .and_then(|params| params.get_bool(key))
+    }
+
+    pub fn get_parameter_u16(&self, key: &str) -> Option<u16> {
+        self.parameters
+            .as_ref()
+            .and_then(|params| params.get_u16(key))
+    }
+
+    pub fn get_parameter_u32(&self, key: &str) -> Option<u32> {
+        self.parameters
+            .as_ref()
+            .and_then(|params| params.get_u32(key))
+    }
 }
 pub struct DiameterStack {
     config: StackConfig,
@@ -379,9 +401,13 @@ impl DiameterStack {
                     {
                         let addresses: Vec<String> = listen_address.hosts.iter()
                             .map(|host| format!("{}:{}", host, listen_address.port))
-                            .collect();                        
+                            .collect();    
+                        let stream_id = listen_address.get_parameter_u16("stream_id").unwrap_or(0);                    
+                        let ppid = listen_address.get_parameter_u32("ppid").unwrap_or(0);
                         
                         let server = SctpDiameterServer::new(
+                            stream_id,
+                            ppid,
                                 self.config.host.clone(),
                                 self.config.realm.clone(),
                                 self.config.capability.clone(),
@@ -629,12 +655,18 @@ impl DiameterStack {
                                                 .iter()
                                                 .map(|host| format!("{}:{}", host, addr.port))
                                                 .collect();
-                                            let conn = SctpClientConnection::new(
+                                            let stream_id = addr.get_parameter_u16("stream_id").unwrap_or(0);
+                                            let ppid = addr.get_parameter_u32("ppid").unwrap_or(0);
+
+                                            let conn = SctpClientConnection::new(                                                
                                                 addresses,
+                                                stream_id,
+                                                ppid,
                                                 self.config.host.clone(),
                                                 self.config.realm.clone(),
                                                 peer_host.clone(),
                                                 peer_realm.clone(),
+                                                self.config.capability.clone(),
                                                 key_file.clone(),
                                                 cert_file.clone(),
                                                 ca_cert_file.clone(),

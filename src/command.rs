@@ -614,7 +614,7 @@ impl Command {
             + self
                 .avps
                 .iter()
-                .map(|avp| avp.total_length() as usize)
+                .map(|avp| avp.total_length_including_padding() as usize)
                 .sum::<usize>();
         let mut buffer = BytesMut::new();
 
@@ -653,7 +653,7 @@ impl Command {
         while offset + 8 <= length as usize {
             match Avp::decode(&data[offset..]) {
                 Ok(avp) => {
-                    offset += avp.total_length() as usize;
+                    offset += avp.total_length_including_padding() as usize;
                     avps.push(avp);
                 }
                 Err(e) => return Err(format!("Failed to decode AVP at offset {}: {}", offset, e)),

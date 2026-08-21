@@ -24,12 +24,16 @@ impl ConnectionList {
     }
 
     /// Appends a connection to the end of the list.
+    /// # Arguments
+    /// * `connection` - The connection to add.
     pub async fn add_connection(&self, connection: Arc<Box<dyn Connection + Send + Sync>>) {
         let mut connections = self.connections.lock().await;
         connections.push(connection);
     }
 
     /// Removes the connection that points to the same allocation as `connection`.
+    /// # Arguments
+    /// * `connection` - The connection to remove.
     pub async fn remove_connection(&self, connection: Arc<Box<dyn Connection + Send + Sync>>) {
         let mut connections = self.connections.lock().await;
         connections.retain(|conn| !Arc::ptr_eq(conn, &connection));
@@ -48,6 +52,10 @@ impl ConnectionList {
     }
 
     /// Returns the connection at `index`, or `None` if the index is out of bounds.
+    /// # Arguments
+    /// * `index` - The index of the connection to retrieve.
+    /// Returns
+    /// * `Some(Arc<Box<dyn Connection + Send + Sync>>)` if the index is valid, or `None` if it is out of bounds.
     pub async fn get_connection(
         &self,
         index: usize,
@@ -57,6 +65,9 @@ impl ConnectionList {
     }
 
     /// Returns a snapshot of all connections currently in the list.
+    /// Blocks until the lock is held.
+    /// Returns
+    /// * `Vec<Arc<Box<dyn Connection + Send + Sync>>>` - A vector containing all connections in the list.
     pub async fn get_connections(&self) -> Vec<Arc<Box<dyn Connection + Send + Sync>>> {
         let conn_list = self.connections.lock().await;
         conn_list.clone()

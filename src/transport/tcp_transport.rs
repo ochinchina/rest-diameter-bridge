@@ -23,6 +23,7 @@ type BoxedReader = Box<dyn AsyncRead + Send + Unpin>;
 
 #[derive(Clone)]
 pub struct TcpClientConnection {
+    // The address of the TCP server to connect to in format "host:port"
     address: String,
     my_host: String,
     my_realm: String,
@@ -291,10 +292,11 @@ impl TcpClientConnection {
         ];
 
         avps.extend(create_capability_avps(&self.capability, &self.avp_map));
+        
 
         let cer_command = Command::new(
             CommandCode::CapabilitiesExchange as u32,
-            CommandFlags::Request as u8 | CommandFlags::Proxiable as u8,
+            CommandFlags::Request as u8,
             0,
             self.hop_by_hop_id_generator.next_id(),
             self.end_to_end_id_generator.next_id(),
@@ -331,7 +333,7 @@ impl TcpClientConnection {
     async fn send_dwr(&self) -> Result<(), String> {
         let dwr_command = Command::new(
             CommandCode::DeviceWatchdog as u32,
-            CommandFlags::Request as u8 | CommandFlags::Proxiable as u8,
+            CommandFlags::Request as u8,
             0,
             self.hop_by_hop_id_generator.next_id(),
             self.end_to_end_id_generator.next_id(),
@@ -362,7 +364,7 @@ impl TcpClientConnection {
     async fn send_dwa(&self) -> Result<(), String> {
         let dwa_command = Command::new(
             CommandCode::DeviceWatchdog as u32,
-            CommandFlags::Proxiable as u8,
+            0,
             0,
             self.hop_by_hop_id_generator.next_id(),
             self.end_to_end_id_generator.next_id(),
@@ -391,7 +393,7 @@ impl TcpClientConnection {
     async fn send_dpr_command(&self) -> Result<(), String> {
         let dpr_command = Command::new(
             CommandCode::DisconnectPeer as u32,
-            CommandFlags::Request as u8 | CommandFlags::Proxiable as u8,
+            CommandFlags::Request as u8,
             0,
             self.hop_by_hop_id_generator.next_id(),
             self.end_to_end_id_generator.next_id(),
@@ -429,16 +431,12 @@ impl TcpClientConnection {
         let mut buffer = [0; 1024];
         let mut command_buffer = crate::command::CommandBuffer::new();
         let mut ticker = interval(Duration::from_secs(30));
-        let mut first_tick = true;
+        ticker.tick().await; // Initial tick to start the loop immediately
         let address = self.address.clone();
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
                     info!("Connection idle for 30 seconds, send DWR.");
-                    if first_tick {
-                        first_tick = false;
-                        continue; // Skip the first tick to avoid sending DWR immediately after connection
-                    }
                     self.send_dwr().await?;
                 }
                 result = reader.read(&mut buffer) => {
@@ -522,7 +520,7 @@ impl TcpClientConnection {
         );
         let dwa = Command::new(
             CommandCode::DisconnectPeer as u32,
-            CommandFlags::Proxiable as u8,
+            0,
             0,
             command.hop_by_hop_id,
             command.end_to_end_id,
@@ -761,7 +759,7 @@ impl TcpServerConnection {
             self.id
         );
         if command.code == CommandCode::DeviceWatchdog as u32 && command.is_request() {
-            self.process_dwa(command).await?;
+            self.process_dwr(command).await?;
             return Ok(());
         }
 
@@ -789,10 +787,10 @@ impl TcpServerConnection {
         context.process_command(command).await
     }
 
-    async fn process_dwa(&mut self, command: &Command) -> Result<(), String> {
+    async fn process_dwr(&mut self, command: &Command) -> Result<(), String> {
         let dwa = Command::new(
             CommandCode::DeviceWatchdog as u32,
-            CommandFlags::Proxiable as u8,
+            0,
             0,
             command.hop_by_hop_id,
             command.end_to_end_id,
@@ -828,7 +826,7 @@ impl TcpServerConnection {
     async fn process_dpr(&mut self, command: &Command) -> Result<(), String> {
         let dpr = Command::new(
             CommandCode::DisconnectPeer as u32,
-            CommandFlags::Proxiable as u8,
+            0,
             0,
             command.hop_by_hop_id,
             command.end_to_end_id,
@@ -1227,11 +1225,12 @@ impl TcpDiameterServer {
     fn create_cea(&self, cer_command: &Command) -> Command {
         let mut cea = Command::new(
             CommandCode::CapabilitiesExchange as u32,
-            CommandFlags::Proxiable as u8,
+            0,
             0,
             cer_command.hop_by_hop_id,
             cer_command.end_to_end_id,
             vec![
+                name_value_to_avp("Result-Code", &Value::Number(ResultCode::DiameterSuccess.as_u32().into()), &self.avp_map).unwrap(),
                 name_value_to_avp(
                     "Origin-Host",
                     &Value::String(self.host.clone()),

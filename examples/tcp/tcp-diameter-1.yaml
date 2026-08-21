@@ -1,0 +1,44 @@
+stacks:
+- name: gateway-a
+  realm: gateway-a.example.com
+  host: gateway-a
+
+  # Timeouts (milliseconds)
+  request-timeout: 10000
+  connection-request-timeout: 5000
+  cer-timeout: 5000
+
+  # AVP and command definition files
+  avp-files: ["avps.yaml"]
+  command-files: ["commands.yaml"]
+
+  # REST API listener - accepts JSON Diameter messages from HTTP clients
+  rest-listen:
+  - address: "0.0.0.0:8080"
+    path: "/diameter"
+  
+  listen: 
+  - address: "tcp://127.0.0.1:3867"
+
+  # Connect to Gateway B as a Diameter peer
+  peers:
+  - host: gateway-b@gateway-b.example.com
+    connection-url: "tcp://127.0.0.1:3868"
+
+  # Route all messages to Gateway B
+  routing:
+    policy: "REALM"
+    default: gateway-b@gateway-b.example.com
+
+  # Diameter capabilities exchanged during CER/CEA
+  capability:
+    vendor-id: 10415
+    host-ips: ["127.0.0.1"]
+    product-name: "Gateway-A"
+    auth-application-ids: [16777217]
+    inband-security-ids: [0]
+    firmware-revision: 1
+    vendor-specific-application-ids:
+    - vendor-id: 10415
+      auth-application-id: 16777217
+      acct-application-id: 16777217

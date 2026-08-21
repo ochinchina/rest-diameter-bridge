@@ -153,12 +153,7 @@ impl RequestProcessor {
                 if request.get_destination_host().is_some() {
                     answer.set_origin_host(&request.get_destination_host().unwrap_or_default());
                 }
-                if request.get_origin_host().is_some() {
-                    answer.set_destination_host(&request.get_origin_host().unwrap_or_default());
-                }
-                if request.get_origin_realm().is_some() {
-                    answer.set_destination_realm(&request.get_origin_realm().unwrap_or_default());
-                }
+                
                 info!(
                     "Received answer for request with code {} and hop-by-hop ID {}: {}",
                     answer.code,

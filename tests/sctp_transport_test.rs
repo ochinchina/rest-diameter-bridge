@@ -97,6 +97,21 @@ fn make_connection_manager(
     )))
 }
 
+fn make_capability_with_host_ips(host_ips: Vec<String>) -> StackCapability {
+    StackCapability {
+        vendor_id: 0,
+        product_name: "test".to_string(),
+        host_ips: Some(host_ips),
+        supported_vendor_ids: None,
+        auth_application_ids: Some(vec![4]),
+        acct_application_ids: None,
+        vendor_specific_application_ids: None,
+        inband_security_ids: None,
+        firmware_revision: None,
+        _extra: HashMap::new(),
+    }
+}
+
 fn make_sctp_client(addresses: Vec<String>) -> SctpClientConnection {
     let hop_gen = Arc::new(Box::new(IdGenerator::new()));
     let e2e_gen = Arc::new(Box::new(IdGenerator::new()));
@@ -107,10 +122,13 @@ fn make_sctp_client(addresses: Vec<String>) -> SctpClientConnection {
 
     SctpClientConnection::new(
         addresses,
+        0,
+        0,
         "my-host".to_string(),
         "my-realm".to_string(),
         "peer-host".to_string(),
         "peer-realm".to_string(),
+        make_capability_with_host_ips(vec!["127.0.0.1".to_string()]),
         String::new(),
         String::new(),
         String::new(),
@@ -134,6 +152,8 @@ fn make_sctp_server(addresses: Vec<String>) -> SctpDiameterServer {
     let manager = make_connection_manager(answer_manager.clone(), redirect_host_manager.clone());
 
     SctpDiameterServer::new(
+        0,
+        0,
         "server-host".to_string(),
         "server-realm".to_string(),
         make_capability(),
@@ -176,10 +196,13 @@ fn test_sctp_client_connection_can_set_dtls_paths() {
 
     let conn = SctpClientConnection::new(
         vec!["10.0.0.1:5868".to_string()],
+        0,
+        0,
         "my-host".to_string(),
         "my-realm".to_string(),
         "dtls-host".to_string(),
         "dtls-realm".to_string(),
+        make_capability_with_host_ips(vec!["10.0.0.1".to_string()]),
         "/tmp/key.pem".to_string(),
         "/tmp/cert.pem".to_string(),
         "/tmp/ca.pem".to_string(),

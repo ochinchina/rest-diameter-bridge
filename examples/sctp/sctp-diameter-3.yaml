@@ -1,0 +1,34 @@
+stacks:
+- name: gateway-c
+  realm: gateway-c.example.com
+  host: gateway-c
+
+  request-timeout: 10000
+  connection-request-timeout: 5000
+  cer-timeout: 5
+
+  avp-files: ["avps.yaml"]
+  command-files: ["commands.yaml"]
+
+  # Listen for incoming Diameter connections from Gateway B
+  listen:
+  - address: "sctp://127.0.0.1:3869?stream_id=0&ppid=0"
+
+  # Forward received Diameter requests to backend HTTP server as JSON
+  my-request-processors:
+  - command-codes: [306]
+    application-ids: [16777217]
+    urls: ["http://localhost:9090/diameter"]
+    timeout: 5000
+
+  capability:
+    vendor-id: 10415
+    host-ips: ["127.0.0.1"]
+    product-name: "Gateway-C"
+    auth-application-ids: [16777217]
+    inband-security-ids: [0]
+    firmware-revision: 1
+    vendor-specific-application-ids:
+    - vendor-id: 10415
+      auth-application-id: 16777217
+      acct-application-id: 16777217

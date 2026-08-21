@@ -1,0 +1,15 @@
+{
+    "name": "UDR",
+    "Session-Id": "gateway-a.example.com;1690000000;1",
+    "Destination-Realm": "gateway-c.example.com",
+    "Destination-Host": "gateway-c",
+    "Vendor-Specific-Application-Id": {
+        "Vendor-Id": 10415,
+        "Auth-Application-Id": 16777217
+    },
+    "User-Name": "sip:user@example.com",
+    "Data-Reference": 0,
+    "Service-Indication": "MMTEL-Services",
+    "Server-Name": "sip:scscf@example.com",
+    "MSISDN": "1234567890"
+}

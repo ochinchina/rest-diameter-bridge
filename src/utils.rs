@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::avp::{Avp, AvpCode, AvpFlags, AvpMap, name_value_to_avp};
+use crate::avp::{Avp, AvpMap, name_value_to_avp};
 use crate::config::StackCapability;
 
 use serde_json::Value;
@@ -31,7 +31,7 @@ pub fn is_non_empty_file(path: &str) -> bool {
 pub fn create_capability_avps(capability: &StackCapability, avp_map: &AvpMap) -> Vec<Avp> {
     let mut avps = Vec::new();
     for host_ip in capability.host_ips.clone().unwrap_or_default() {
-        let avp = Avp::from_utf8_string(
+        let avp = Avp::from_address(
             avp_map.get_by_name("Host-IP-Address").unwrap().code,
             0,
             None,
@@ -41,12 +41,7 @@ pub fn create_capability_avps(capability: &StackCapability, avp_map: &AvpMap) ->
     }
 
     avps.extend(vec![
-        Avp::from_unsigned32(
-            AvpCode::VendorId as u32,
-            AvpFlags::Mandatory as u8,
-            None,
-            capability.vendor_id,
-        ),
+        
         name_value_to_avp(
             "Vendor-Id",
             &Value::Number(capability.vendor_id.into()),

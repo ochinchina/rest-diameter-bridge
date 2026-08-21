@@ -38,6 +38,7 @@ chrono = { version = "0.4", features = ["serde"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 dtls = { version = "0.17.2", features = ["pem"] }
 libc = "0.2"
+sctp-rs = "0.3.1"
 webrtc-util = { version = "0.17.1", features = ["conn"], default-features = false }
 
 [dev-dependencies]

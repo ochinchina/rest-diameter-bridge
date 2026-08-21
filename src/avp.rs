@@ -274,10 +274,10 @@ impl Avp {
     /// * `flags` - The AVP flags byte (vendor-specific and mandatory bits are handled automatically).
     /// * `vendor_id` - Optional vendor ID for vendor-specific AVPs.
     /// * `data` - The raw encoded value bytes.
-    pub fn new(code: u32, flags: u8, vendor_id: Option<u32>, data: Vec<u8>) -> Self {
+    pub fn new(code: u32, flags: u8, vendor_id: Option<u32>, data: Vec<u8>) -> Self {        
         Avp {
             code,
-            flags: flags & 0x7F, // Ensure the vendor-specific flag is not set in the flags field
+            flags: if vendor_id.is_some() { flags | 0x80 } else { flags & 0x7F }, // Ensure the vendor-specific flag is set if a vendor ID is provided
             vendor_id,
             data: Some(data),
             sub_avps: Vec::new(),
@@ -320,7 +320,7 @@ impl Avp {
         Avp::new(code, flags, vendor_id, data)
     }
 
-    pub fn from_address(code: u32, flags: u8, vendor_id: Option<u32>, address: String) -> Self {
+    pub fn from_address(code: u32, flags: u8, vendor_id: Option<u32>, address: &str) -> Self {
         let mut data = Vec::new();
         if let Ok(ip) = address.parse::<std::net::Ipv4Addr>() {
             data.extend_from_slice(&1u16.to_be_bytes()); // Address type 1 for IPv4
@@ -534,9 +534,8 @@ impl Avp {
                 let mut offset = 0;
                 while offset + 8 <= data.len() {
                     match Avp::decode(&data[offset..]) {
-                        Ok(avp) => {
-                            let padding = (4 - (avp.total_length() % 4)) % 4; // Calculate padding needed to align to 4 bytes
-                            offset += avp.total_length() as usize + padding as usize; // Move offset by AVP length plus padding
+                        Ok(avp) => {                            
+                            offset += avp.total_length_including_padding() as usize; // Move offset by AVP length plus padding
                             sub_avps.push(avp);
                         }
                         Err(_e) => return None, // Failed to decode sub AVP
@@ -559,9 +558,10 @@ impl Avp {
     }
 
     /// Returns the encoded byte length of this AVP (header + value, excluding padding).
-    pub fn total_length(&self) -> u32 {
+    fn total_length(&self) -> u32 {
         match self.data.as_ref() {
-            Some(data) => 8 + data.len() as u32 + if self.is_vendor_specific() { 4 } else { 0 },
+            Some(data) => data.len() as u32 + 8 + if self.is_vendor_specific() { 4 } else { 0 },
+                
             None => {
                 self.sub_avps
                     .iter()
@@ -573,7 +573,7 @@ impl Avp {
         }
     }
 
-    fn total_length_including_padding(&self) -> u32 {
+    pub fn total_length_including_padding(&self) -> u32 {
         let length = self.total_length();
         let remain = length % 4;
         if remain == 0 {
@@ -597,6 +597,9 @@ impl Avp {
         }
         if let Some(data) = self.data.as_ref() {
             buffer.extend_from_slice(data);
+            if data.len() % 4 != 0 {
+                buffer.extend_from_slice(&vec![0; 4 - (data.len() % 4)]); // Add padding
+            }
         } else {
             for sub_avp in &self.sub_avps {
                 let data = sub_avp.encode();
@@ -962,7 +965,7 @@ pub fn name_value_to_avp(name: &str, value: &Value, avp_map: &AvpMap) -> Result<
                         named_avp.code,
                         flags,
                         named_avp.vendor_id,
-                        s.clone(),
+                        s,
                     ));
                 }
                 return Err(()); // Value type mismatch

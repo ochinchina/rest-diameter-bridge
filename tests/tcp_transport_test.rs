@@ -419,7 +419,7 @@ async fn test_tcp_server_connection_send_and_close() {
     // Send a response command (no hop-by-hop remapping for responses)
     let command = Command::new(
         CommandCode::CapabilitiesExchange as u32,
-        CommandFlags::Proxiable as u8,
+        0,
         0,
         100,
         200,
@@ -644,7 +644,7 @@ async fn test_tcp_server_accepts_cer_and_sends_cea() {
 
     let cer = Command::new(
         CommandCode::CapabilitiesExchange as u32,
-        CommandFlags::Request as u8 | CommandFlags::Proxiable as u8,
+        CommandFlags::Request as u8,
         0,
         1,
         1,
@@ -729,7 +729,7 @@ async fn test_tcp_client_connects_and_exchanges_cer_cea() {
         // Send CEA response
         let cea = Command::new(
             CommandCode::CapabilitiesExchange as u32,
-            CommandFlags::Proxiable as u8,
+            0,
             0,
             cer.hop_by_hop_id,
             cer.end_to_end_id,

@@ -10,319 +10,136 @@ use crate::transport::{
 
 use crate::utils::create_capability_avps;
 use crate::utils::{is_empty_file};
+
 use dtls::config::Config as DtlsConfig;
 use dtls::conn::DTLSConn;
 use dtls::crypto::Certificate as DtlsCertificate;
 use log::{debug, error, info};
 
 use serde_json::Value;
+#[cfg(target_os = "linux")]
+use tokio::select;
+#[cfg(target_os = "linux")]
+use tokio::time::interval;
 use webrtc_util::Error;
 use std::any::Any;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 use tokio::sync::Mutex;
 use webrtc_util::conn::Conn as DtlsTransport;
 
 #[cfg(target_os = "linux")]
 mod sctp {
-    use std::io;
     use std::net::{SocketAddr, ToSocketAddrs};
-    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
-    use tokio::io::unix::AsyncFd;
 
-    const IPPROTO_SCTP: libc::c_int = 132;
+    use log::info;
+    use sctp_rs::{BindxFlags, ConnectedSocket, Listener, NotificationOrData, SendData, SendInfo, Socket, SocketToAssociation};
 
-    pub struct SctpStream {
-        inner: AsyncFd<OwnedFd>,
+    fn resolve_addresses(addresses: &[String]) -> Result<Vec<SocketAddr>, String> {
+        addresses
+            .iter()
+            .map(|address| {
+                address
+                    .to_socket_addrs()
+                    .map_err(|e| format!("Failed to resolve address '{}': {}", address, e))?
+                    .next()
+                    .ok_or_else(|| format!("No address resolved for '{}'", address))
+            })
+            .collect()
+    }
+
+    fn create_socket(address: SocketAddr) -> Result<Socket, String> {
+        if address.is_ipv6() {
+            Socket::new_v6(SocketToAssociation::OneToOne)
+                .map_err(|e| format!("Failed to create IPv6 SCTP socket: {}", e))
+        } else {
+            Socket::new_v4(SocketToAssociation::OneToOne)
+                .map_err(|e| format!("Failed to create IPv4 SCTP socket: {}", e))
+        }
+    }
+
+     pub struct SctpStream {
+        stream_id: u16,
+        ppid: u32,
+        inner: ConnectedSocket,
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
     }
 
     impl SctpStream {
-        pub async fn connect(addresses: &[String]) -> Result<Self, String> {
+        pub async fn connect(stream_id: u16, ppid: u32, addresses: &[String]) -> Result<Self, String> {
             if addresses.is_empty() {
                 return Err("No addresses provided for SCTP connection".to_string());
             }
 
-            // Resolve the first address to determine the address family
-            let first_addr: SocketAddr = addresses[0]
-                .to_socket_addrs()
-                .map_err(|e| format!("Failed to resolve address '{}': {}", addresses[0], e))?
-                .next()
-                .ok_or_else(|| format!("No address resolved for '{}'", addresses[0]))?;
+            let resolved = resolve_addresses(addresses)?;
+            let first_addr = resolved[0];
+            let socket = create_socket(first_addr)?;
+            let (inner, assoc_id) = socket
+                .sctp_connectx(&resolved)
+                .await
+                .map_err(|e| format!("SCTP connect failed: {}", e))?;
 
-            let domain = if first_addr.is_ipv6() {
-                libc::AF_INET6
-            } else {
-                libc::AF_INET
-            };
-
-            // Create SCTP one-to-one socket
-            let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, IPPROTO_SCTP) };
-            if fd < 0 {
-                return Err(format!(
-                    "Failed to create SCTP socket: {}",
-                    io::Error::last_os_error()
-                ));
-            }
-
-            let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-
-            // Set non-blocking
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if flags < 0 {
-                return Err(format!(
-                    "Failed to get socket flags: {}",
-                    io::Error::last_os_error()
-                ));
-            }
-            let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-            if ret < 0 {
-                return Err(format!(
-                    "Failed to set non-blocking: {}",
-                    io::Error::last_os_error()
-                ));
-            }
-
-            // Use sctp_connectx to connect with multiple addresses (multi-homing)
-            let mut sockaddrs: Vec<u8> = Vec::new();
-            let mut addr_count = 0usize;
-
-            for addr_str in addresses {
-                let addr: SocketAddr = addr_str
-                    .to_socket_addrs()
-                    .map_err(|e| format!("Failed to resolve address '{}': {}", addr_str, e))?
-                    .next()
-                    .ok_or_else(|| format!("No address resolved for '{}'", addr_str))?;
-
-                match addr {
-                    SocketAddr::V4(v4) => {
-                        let sa = libc::sockaddr_in {
-                            sin_family: libc::AF_INET as libc::sa_family_t,
-                            sin_port: v4.port().to_be(),
-                            sin_addr: libc::in_addr {
-                                s_addr: u32::from_ne_bytes(v4.ip().octets()),
-                            },
-                            sin_zero: [0; 8],
-                        };
-                        let bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                &sa as *const _ as *const u8,
-                                std::mem::size_of::<libc::sockaddr_in>(),
-                            )
-                        };
-                        sockaddrs.extend_from_slice(bytes);
-                    }
-                    SocketAddr::V6(v6) => {
-                        let sa = libc::sockaddr_in6 {
-                            sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                            sin6_port: v6.port().to_be(),
-                            sin6_flowinfo: v6.flowinfo(),
-                            sin6_addr: libc::in6_addr {
-                                s6_addr: v6.ip().octets(),
-                            },
-                            sin6_scope_id: v6.scope_id(),
-                        };
-                        let bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                &sa as *const _ as *const u8,
-                                std::mem::size_of::<libc::sockaddr_in6>(),
-                            )
-                        };
-                        sockaddrs.extend_from_slice(bytes);
-                    }
-                }
-                addr_count += 1;
-            }
-
-            // Initiate non-blocking connect
-            let ret = unsafe {
-                libc::connect(
-                    fd,
-                    sockaddrs.as_ptr() as *const libc::sockaddr,
-                    if first_addr.is_ipv6() {
-                        std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
-                    } else {
-                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
-                    },
-                )
-            };
-
-            if ret < 0 {
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::EINPROGRESS) {
-                    return Err(format!("SCTP connect failed: {}", err));
-                }
-            }
-
-            // Wrap in AsyncFd for tokio integration
-            let async_fd =
-                AsyncFd::new(owned_fd).map_err(|e| format!("Failed to create AsyncFd: {}", e))?;
-
-            // Wait for connect to complete
-            loop {
-                let mut guard = async_fd
-                    .writable()
-                    .await
-                    .map_err(|e| format!("Failed waiting for SCTP connect: {}", e))?;
-
-                // Check SO_ERROR to see if connect succeeded
-                let mut err: libc::c_int = 0;
-                let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-                let ret = unsafe {
-                    libc::getsockopt(
-                        async_fd.as_raw_fd(),
-                        libc::SOL_SOCKET,
-                        libc::SO_ERROR,
-                        &mut err as *mut _ as *mut libc::c_void,
-                        &mut len,
-                    )
-                };
-                if ret < 0 {
-                    return Err(format!(
-                        "getsockopt SO_ERROR failed: {}",
-                        io::Error::last_os_error()
-                    ));
-                }
-                if err == 0 {
-                    guard.clear_ready();
-                    break;
-                } else if err == libc::EINPROGRESS {
-                    guard.clear_ready();
-                    continue;
-                } else {
-                    return Err(format!(
-                        "SCTP connect failed: {}",
-                        io::Error::from_raw_os_error(err)
-                    ));
-                }
-            }
-
-            // If we have multiple addresses, bind additional local addresses via sctp_bindx
-            // For connectx with multiple remote addresses, use SCTP_SOCKOPT_CONNECTX
-            if addr_count > 1 {
-                // Use setsockopt SCTP_SOCKOPT_CONNECTX for multi-homed connection
-                // This is already handled by the initial connect for the primary address;
-                // additional peer addresses can be added via sctp_connectx if available
-                // For simplicity, we connect to the first address and the SCTP stack
-                // will handle path failover if the peer advertises multiple addresses in INIT-ACK
-            }
-
-            let local_addr = socket_addr(async_fd.as_raw_fd(), false)?;
+            let local_addrs = inner
+                .sctp_getladdrs(assoc_id)
+                .map_err(|e| format!("Failed to resolve local SCTP address: {}", e))?;
+            let remote_addrs = inner
+                .sctp_getpaddrs(assoc_id)
+                .map_err(|e| format!("Failed to resolve remote SCTP address: {}", e))?;
 
             Ok(SctpStream {
-                inner: async_fd,
-                local_addr,
-                remote_addr: first_addr,
+                stream_id,
+                ppid,
+                inner,
+                local_addr: local_addrs.into_iter().next().unwrap_or(first_addr),
+                remote_addr: remote_addrs.into_iter().next().unwrap_or(first_addr),
             })
         }
 
         pub async fn read(&self, buf: &mut [u8]) -> Result<usize, String> {
-            loop {
-                let mut guard = self
-                    .inner
-                    .readable()
-                    .await
-                    .map_err(|e| format!("Failed waiting for readable: {}", e))?;
-
-                let ret = unsafe {
-                    libc::recv(
-                        self.inner.as_raw_fd(),
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        buf.len(),
-                        0,
-                    )
-                };
-
-                if ret >= 0 {
-                    guard.clear_ready();
-                    return Ok(ret as usize);
+            match self
+                .inner
+                .sctp_recv()
+                .await
+                .map_err(|e| format!("SCTP read error: {}", e))?
+            {
+                NotificationOrData::Data(data) => {
+                    let len = data.payload.len().min(buf.len());
+                    if len > 0 {
+                        buf[..len].copy_from_slice(&data.payload[..len]);
+                    }
+                    Ok(len)
                 }
-
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::WouldBlock {
-                    guard.clear_ready();
-                    continue;
-                }
-                return Err(format!("SCTP read error: {}", err));
+                NotificationOrData::Notification(_) => {
+                    info!("SCTP notification received instead of data");
+                    Err("SCTP notification received instead of data".to_string())
+                },
             }
-        }
-
-        pub async fn read_exact(&self, buf: &mut [u8]) -> Result<(), String> {
-            let mut offset = 0;
-            while offset < buf.len() {
-                let n = self.read(&mut buf[offset..]).await?;
-                if n == 0 {
-                    return Err("SCTP connection closed unexpectedly".to_string());
-                }
-                offset += n;
-            }
-            Ok(())
         }
 
         pub async fn write_all(&self, data: &[u8]) -> Result<(), String> {
-            let mut offset = 0;
-            while offset < data.len() {
-                let mut guard = self
-                    .inner
-                    .writable()
-                    .await
-                    .map_err(|e| format!("Failed waiting for writable: {}", e))?;
-
-                let ret = unsafe {
-                    libc::send(
-                        self.inner.as_raw_fd(),
-                        data[offset..].as_ptr() as *const libc::c_void,
-                        data.len() - offset,
-                        libc::MSG_NOSIGNAL,
-                    )
-                };
-
-                if ret >= 0 {
-                    offset += ret as usize;
-                    guard.clear_ready();
-                } else {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::WouldBlock {
-                        guard.clear_ready();
-                        continue;
-                    }
-                    return Err(format!("SCTP write error: {}", err));
-                }
-            }
-            Ok(())
+            self.send_message(data).await.map(|_| ())
         }
 
         pub async fn send_message(&self, data: &[u8]) -> Result<usize, String> {
-            loop {
-                let mut guard = self
-                    .inner
-                    .writable()
-                    .await
-                    .map_err(|e| format!("Failed waiting for writable: {}", e))?;
-
-                let ret = unsafe {
-                    libc::send(
-                        self.inner.as_raw_fd(),
-                        data.as_ptr() as *const libc::c_void,
-                        data.len(),
-                        libc::MSG_NOSIGNAL,
-                    )
-                };
-
-                if ret >= 0 {
-                    guard.clear_ready();
-                    return Ok(ret as usize);
-                }
-
-                let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::WouldBlock {
-                    guard.clear_ready();
-                    continue;
-                }
-                return Err(format!("SCTP write error: {}", err));
-            }
+            let send_info = SendInfo {
+                sid: self.stream_id,
+                ppid: self.ppid,
+                flags: 0,
+                context: 0,
+                assoc_id: 0,
+            };
+            self.inner
+                .sctp_send(SendData {
+                    payload: data.to_vec(),
+                    snd_info: Some(send_info),
+                })
+                .await
+                .map_err(|e| format!("SCTP write error: {}", e))
+                .map(|_| data.len())
         }
 
         pub fn local_addr(&self) -> SocketAddr {
@@ -334,248 +151,94 @@ mod sctp {
         }
 
         pub async fn shutdown(&self) -> Result<(), String> {
-            let ret = unsafe { libc::shutdown(self.inner.as_raw_fd(), libc::SHUT_RDWR) };
-            if ret < 0 {
-                let err = io::Error::last_os_error();
-                // Ignore "not connected" errors during shutdown
-                if err.raw_os_error() != Some(libc::ENOTCONN) {
-                    return Err(format!("SCTP shutdown error: {}", err));
-                }
-            }
-            Ok(())
+            self.inner
+                .shutdown(std::net::Shutdown::Both)
+                .map_err(|e| format!("SCTP shutdown error: {}", e))
         }
     }
 
-    // Safety: The OwnedFd inside AsyncFd is Send + Sync
     unsafe impl Send for SctpStream {}
     unsafe impl Sync for SctpStream {}
 
-    fn socket_addr(fd: libc::c_int, peer: bool) -> Result<SocketAddr, String> {
-        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        let ret = unsafe {
-            if peer {
-                libc::getpeername(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len)
-            } else {
-                libc::getsockname(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len)
-            }
-        };
-        if ret < 0 {
-            return Err(format!(
-                "Failed to get SCTP socket address: {}",
-                io::Error::last_os_error()
-            ));
-        }
-
-        match storage.ss_family as libc::c_int {
-            libc::AF_INET => {
-                let address = unsafe { &*(&storage as *const _ as *const libc::sockaddr_in) };
-                Ok(SocketAddr::new(
-                    std::net::Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()).into(),
-                    u16::from_be(address.sin_port),
-                ))
-            }
-            libc::AF_INET6 => {
-                let address = unsafe { &*(&storage as *const _ as *const libc::sockaddr_in6) };
-                Ok(SocketAddr::new(
-                    std::net::Ipv6Addr::from(address.sin6_addr.s6_addr).into(),
-                    u16::from_be(address.sin6_port),
-                ))
-            }
-            family => Err(format!("Unsupported SCTP address family: {}", family)),
-        }
-    }
-
     pub struct SctpListener {
-        inner: AsyncFd<OwnedFd>,
+        stream_id: u16,
+        ppid: u32,
+        inner: Listener,
     }
 
     impl SctpListener {
-        pub async fn bind(addresses: &[String]) -> Result<Self, String> {
+        pub async fn bind(stream_id: u16, ppid: u32, addresses: &[String]) -> Result<Self, String> {
             if addresses.is_empty() {
                 return Err("No addresses provided for SCTP listener".to_string());
             }
 
-            let first_addr: SocketAddr = addresses[0]
-                .to_socket_addrs()
-                .map_err(|e| format!("Failed to resolve address '{}': {}", addresses[0], e))?
-                .next()
-                .ok_or_else(|| format!("No address resolved for '{}'", addresses[0]))?;
-
-            let domain = if first_addr.is_ipv6() {
-                libc::AF_INET6
+            let resolved = resolve_addresses(addresses)?;
+            let first_addr = resolved[0];
+            let socket = create_socket(first_addr)?;
+            if resolved.len() > 1 {
+                socket
+                    .sctp_bindx(&resolved, BindxFlags::Add)
+                    .map_err(|e| format!("Failed to bind SCTP listener addresses: {}", e))?;
             } else {
-                libc::AF_INET
-            };
-
-            let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, IPPROTO_SCTP) };
-            if fd < 0 {
-                return Err(format!(
-                    "Failed to create SCTP socket: {}",
-                    io::Error::last_os_error()
-                ));
+                socket
+                    .bind(first_addr)
+                    .map_err(|e| format!("Failed to bind SCTP listener to {}: {}", first_addr, e))?;
             }
-
-            let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-
-            // Set SO_REUSEADDR
-            let optval: libc::c_int = 1;
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::SOL_SOCKET,
-                    libc::SO_REUSEADDR,
-                    &optval as *const _ as *const libc::c_void,
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                );
-            }
-
-            // Bind to the first address
-            let bind_result = match first_addr {
-                SocketAddr::V4(v4) => {
-                    let sa = libc::sockaddr_in {
-                        sin_family: libc::AF_INET as libc::sa_family_t,
-                        sin_port: v4.port().to_be(),
-                        sin_addr: libc::in_addr {
-                            s_addr: u32::from_ne_bytes(v4.ip().octets()),
-                        },
-                        sin_zero: [0; 8],
-                    };
-                    unsafe {
-                        libc::bind(
-                            fd,
-                            &sa as *const _ as *const libc::sockaddr,
-                            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                        )
-                    }
-                }
-                SocketAddr::V6(v6) => {
-                    let sa = libc::sockaddr_in6 {
-                        sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                        sin6_port: v6.port().to_be(),
-                        sin6_flowinfo: v6.flowinfo(),
-                        sin6_addr: libc::in6_addr {
-                            s6_addr: v6.ip().octets(),
-                        },
-                        sin6_scope_id: v6.scope_id(),
-                    };
-                    unsafe {
-                        libc::bind(
-                            fd,
-                            &sa as *const _ as *const libc::sockaddr,
-                            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-                        )
-                    }
-                }
-            };
-            if bind_result < 0 {
-                return Err(format!(
-                    "Failed to bind SCTP socket to {}: {}",
-                    first_addr,
-                    io::Error::last_os_error()
-                ));
-            }
-
-            // Listen
-            let ret = unsafe { libc::listen(fd, 128) };
-            if ret < 0 {
-                return Err(format!(
-                    "Failed to listen on SCTP socket: {}",
-                    io::Error::last_os_error()
-                ));
-            }
-
-            // Set non-blocking
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if flags < 0 {
-                return Err(format!(
-                    "Failed to get socket flags: {}",
-                    io::Error::last_os_error()
-                ));
-            }
-            let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-            if ret < 0 {
-                return Err(format!(
-                    "Failed to set non-blocking: {}",
-                    io::Error::last_os_error()
-                ));
-            }
-
-            let async_fd =
-                AsyncFd::new(owned_fd).map_err(|e| format!("Failed to create AsyncFd: {}", e))?;
-
-            Ok(SctpListener { inner: async_fd })
+            let listener = socket
+                .listen(128)
+                .map_err(|e| format!("Failed to listen on SCTP socket: {}", e))?;
+            Ok(SctpListener { stream_id, ppid, inner: listener })
         }
 
         pub async fn accept(&self) -> Result<(SctpStream, SocketAddr), String> {
-            loop {
-                let mut guard = self
-                    .inner
-                    .readable()
-                    .await
-                    .map_err(|e| format!("Failed waiting for accept: {}", e))?;
-
-                let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-                let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-
-                let client_fd = unsafe {
-                    libc::accept(
-                        self.inner.as_raw_fd(),
-                        &mut storage as *mut _ as *mut libc::sockaddr,
-                        &mut len,
-                    )
-                };
-
-                if client_fd < 0 {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::WouldBlock {
-                        guard.clear_ready();
-                        continue;
-                    }
-                    return Err(format!("SCTP accept error: {}", err));
-                }
-
-                guard.clear_ready();
-
-                // Set non-blocking on the accepted socket
-                let flags = unsafe { libc::fcntl(client_fd, libc::F_GETFL) };
-                if flags < 0 {
-                    unsafe { libc::close(client_fd) };
-                    return Err(format!(
-                        "Failed to get socket flags: {}",
-                        io::Error::last_os_error()
-                    ));
-                }
-                let ret =
-                    unsafe { libc::fcntl(client_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-                if ret < 0 {
-                    unsafe { libc::close(client_fd) };
-                    return Err(format!(
-                        "Failed to set non-blocking: {}",
-                        io::Error::last_os_error()
-                    ));
-                }
-
-                let owned_fd = unsafe { OwnedFd::from_raw_fd(client_fd) };
-                let async_fd = AsyncFd::new(owned_fd)
-                    .map_err(|e| format!("Failed to create AsyncFd: {}", e))?;
-
-                let local_addr = socket_addr(client_fd, false)?;
-                let remote_addr = socket_addr(client_fd, true)?;
-
-                let stream = SctpStream {
-                    inner: async_fd,
-                    local_addr,
-                    remote_addr,
-                };
-
-                return Ok((stream, remote_addr));
-            }
+            let (stream, addr) = self
+                .inner
+                .accept()
+                .await
+                .map_err(|e| format!("SCTP accept error: {}", e))?;
+            Ok((
+                SctpStream {
+                    stream_id: self.stream_id,
+                    ppid: self.ppid,
+                    inner: stream,
+                    local_addr: addr,
+                    remote_addr: addr,
+                },
+                addr,
+            ))
         }
     }
 
     unsafe impl Send for SctpListener {}
     unsafe impl Sync for SctpListener {}
+}
+
+
+#[cfg(target_os = "linux")]
+async fn read_command_from_sctp(stream: &Arc<SctpConnectionStream>) -> Result<Command, String> {
+        
+    let mut buffer = [0u8; 64*1024];
+    
+        if let Ok(n) = stream.read(&mut buffer).await {
+            info!("Read {} bytes from SCTP stream", n);
+
+            
+            let mut command_buffer = CommandBuffer::from_bytes(&buffer[..n]);
+            match command_buffer.read_command() {
+                Some(command) => {                    
+                    return Ok(command)
+                }
+                None => {
+                    info!("Failed to parse command from SCTP stream");
+                    return Err("Failed to parse command from SCTP stream".to_string());
+                }
+            }        
+
+        } else {
+            return Err("Failed to read from SCTP stream".to_string());
+        }
+    
+    
 }
 
 #[cfg(target_os = "linux")]
@@ -639,7 +302,7 @@ impl DtlsTransport for SctpStream {
 }
 
 #[cfg(target_os = "linux")]
-enum SctpConnectionStream {
+pub enum SctpConnectionStream {
     Plain(Arc<SctpStream>),
     Dtls(Arc<DTLSConn>),
 }
@@ -685,6 +348,7 @@ impl SctpConnectionStream {
                 .map_err(|e| format!("DTLS shutdown error: {}", e)),
         }
     }
+
 }
 
 #[cfg(target_os = "linux")]
@@ -692,10 +356,13 @@ impl SctpConnectionStream {
 pub struct SctpClientConnection {
     // Similar to TcpClientConnection but using SCTP instead of TCP
     addresses: Vec<String>,
+    stream_id: u16,
+    ppid: u32,
     my_host: String,
     my_realm: String,
     peer_host: String,
     peer_realm: String,
+    capability: StackCapability,
     key_file: String,
     cert_file: String,
     ca_cert_file: String,    
@@ -715,10 +382,13 @@ pub struct SctpClientConnection {
 impl SctpClientConnection {
     pub fn new(
         addresses: Vec<String>,
+        stream_id: u16,
+        ppid: u32,
         my_host: String,
         my_realm: String,
         peer_host: String,
         peer_realm: String,
+        capability: StackCapability,
         key_file: String,
         cert_file: String,
         ca_cert_file: String,
@@ -734,10 +404,13 @@ impl SctpClientConnection {
     ) -> Self {
         SctpClientConnection {
             addresses,
+            stream_id,
+            ppid,
             my_host,
             my_realm,
             peer_host,
             peer_realm,
+            capability,
             key_file: key_file,
             cert_file: cert_file,
             ca_cert_file: ca_cert_file,
@@ -757,10 +430,16 @@ impl SctpClientConnection {
     
     pub fn spawn_start(&self) {
         let mut connection = self.clone();
-        tokio::spawn(async move {
-            if let Err(error) = connection.start().await {
-                error!("SctpClientConnection start error: {}", error);
-            }
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create SCTP client runtime");
+            rt.block_on(async move {
+                if let Err(error) = connection.start().await {
+                    error!("SctpClientConnection start error: {}", error);
+                }
+            });
         });
     }
 
@@ -812,7 +491,8 @@ impl SctpClientConnection {
 
     pub async fn start(&mut self) -> Result<(), String> {
         loop {
-            match SctpStream::connect(&self.addresses).await {
+            
+            match SctpStream::connect(self.stream_id, self.ppid, &self.addresses).await {
                 Ok(stream) => {
                     info!(
                         "Successfully connected to SCTP server at {:?}",
@@ -822,37 +502,48 @@ impl SctpClientConnection {
                     *self.writer.lock().await = Some(stream.clone());
                     self.send_cer().await?;
 
-                    let cea = self.read_command_from_sctp(&stream).await?;
-                    info!("Received CEA: {:?}", cea);
+                    select! {
+                        cea = read_command_from_sctp(&stream) => {
+                            if cea.is_err() {
+                                error!("Failed to read CEA from SCTP stream: {}", cea.unwrap_err());
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                continue;
+                            }
+                            let cea = cea.unwrap();
+                            info!("Received CEA: {}", cea.to_pretty_json_str(&self.command_map, &self.avp_map));
 
-                    if cea.code != CommandCode::CapabilitiesExchange as u32 || !cea.is_answer() {
-                        return Err(format!(
-                            "Expected CEA with command code {}, got {}",
-                            CommandCode::CapabilitiesExchange as u32,
-                            cea.code
-                        ));
+                            if cea.code != CommandCode::CapabilitiesExchange as u32 || !cea.is_answer() {
+                                error!("Expected CEA with command code {}, got {}", CommandCode::CapabilitiesExchange as u32, cea.code);
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                continue;
+                            }
+
+                            if let Some(result_code) = cea.get_result_code() {
+                                if result_code < 2000 || result_code >= 3000 {
+                                    error!("Connection rejected by server with result code {}", result_code);   
+                                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                    continue;
+                                }
+                            } else {
+                                error!("CEA does not contain a Result-Code AVP");
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                continue;
+                            }
+
+                            let reader_stream = stream.clone();
+                            let self_clone = self.clone();
+
+                            if let Err(e) =self_clone.handle_connection(reader_stream).await {
+                                    error!("SCTP connection error: {}", e);
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                            error!("CER timeout after {:?}", 30);
+                            self.close().await.ok();
+                            continue;
+                        }
                     }
 
-                    if let Some(result_code) = cea.get_result_code() {
-                        if result_code / 2000 != 2 {
-                            return Err(format!(
-                                "Connection rejected by server with result code {}",
-                                result_code
-                            ));
-                        }
-                    } else {
-                        return Err("CEA response missing Result-Code AVP".to_string());
-                    }
-
-                    let reader_stream = stream.clone();
-                    let self_clone = self.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) =self_clone.handle_connection(reader_stream).await {
-                            error!("SCTP connection error: {}", e);
-                        }
-                    });
-
-                    return Ok(());
                 }
                 Err(e) => {
                     error!(
@@ -866,65 +557,123 @@ impl SctpClientConnection {
     }
 
     async fn send_cer(&mut self) -> Result<(), String> {
+        let mut avps = vec![
+            name_value_to_avp(
+                "Origin-Host",
+                &Value::String(self.my_host.clone()),
+                &self.avp_map,
+            )
+            .unwrap(),
+            name_value_to_avp(
+                "Origin-Realm",
+                &Value::String(self.my_realm.clone()),
+                &self.avp_map,
+            )
+            .unwrap(),
+        ];
+
+        avps.extend(create_capability_avps(&self.capability, &self.avp_map));
+
         let cer_command = Command::new(
             CommandCode::CapabilitiesExchange as u32,
-            CommandFlags::Request as u8 | CommandFlags::Proxiable as u8,
+            CommandFlags::Request as u8,
             0,
             self.hop_by_hop_id_generator.next_id(),
             self.end_to_end_id_generator.next_id(),
-            vec![],
+            avps,
         );
-        self.send(&cer_command).await
+
+        info!("Sending CER: {} to {}", cer_command.to_json(&self.command_map, &self.avp_map), self.get_id());
+        match self.send(&cer_command).await {
+            Ok(_) => {
+                info!("Succeed to send CER: {} to {}", cer_command.to_json(&self.command_map, &self.avp_map), self.get_id());
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to send CER: {}", e);
+                Err(e)
+            }
+        }
     }
 
-    async fn read_command_from_sctp(
-        &self,
-        stream: &Arc<SctpConnectionStream>,
-    ) -> Result<Command, String> {
-        let mut length_buffer = [0u8; 4];
-        read_exact(stream, &mut length_buffer).await?;
-        let message_length = u32::from_be_bytes(length_buffer) & 0x00FFFFFF;
-        let mut buffer = vec![0u8; message_length as usize - 4];
-        read_exact(stream, &mut buffer).await?;
-        let mut command_buffer = CommandBuffer::from_bytes(&length_buffer);
-        command_buffer.append(&buffer);
-        command_buffer
-            .read_command()
-            .ok_or_else(|| "Failed to parse command from SCTP stream".to_string())
-    }
 
     async fn handle_connection(&self, stream: Arc<SctpConnectionStream>) -> Result<(), String> {
         let mut buffer = [0u8; 4096];
         let mut command_buffer = CommandBuffer::new();
+        let mut ticker = interval(Duration::from_secs(30));
+        ticker.tick().await; // Initial tick to start the loop immediately
+
+        info!("Starting to handle SCTP connection with peer: {}", self.get_id());
+        
         loop {
-            match stream.read(&mut buffer).await {
-                Ok(0) => {
-                    info!("SCTP connection closed by server");
-                    return Ok(());
+            select! {
+                _ = ticker.tick() => {
+                    info!("Connection idle for 30 seconds, send DWR.");
+                    self.send_dwr().await?;
                 }
-                Ok(n) => {
-                    info!("SCTP received {} bytes", n);
-                    command_buffer.append(&buffer[..n]);
-                    let commands = command_buffer.read_commands();
-                    for mut command in commands {
-                        info!(
-                            "Received {} command: {:?}",
-                            if command.is_request() {
-                                "request"
-                            } else {
-                                "answer"
-                            },
-                            command
-                        );
-                        self.process_command(&mut command).await?;
+                
+                result = stream.read(&mut buffer) => {
+                    match result {
+                        Ok(0) => {
+                            info!("SCTP connection closed by server");
+                            return Ok(());
+                        }
+                        Ok(n) => {
+                            info!("SCTP received {} bytes", n);
+                            command_buffer.append(&buffer[..n]);
+                            let commands = command_buffer.read_commands();
+                            for mut command in commands {
+                                info!(
+                                    "Received {} command: {}",
+                                    if command.is_request() {
+                                        "request"
+                                    } else {
+                                        "answer"
+                                    },
+                                    command.to_pretty_json_str(&self.command_map, &self.avp_map)
+                                );
+                                self.process_command(&mut command).await?;
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to read from SCTP connection: {}", e);
+                            return Err(e);
+                        }
                     }
-                }
-                Err(e) => {
-                    error!("Failed to read from SCTP connection: {}", e);
-                    return Err(e);
                 }
             }
         }
+    }
+
+    async fn send_dwr(&self) -> Result<(), String> {
+        let dwr_command = Command::new(
+            CommandCode::DeviceWatchdog as u32,
+            CommandFlags::Request as u8,
+            0,
+            self.hop_by_hop_id_generator.next_id(),
+            self.end_to_end_id_generator.next_id(),
+            vec![
+                name_value_to_avp(
+                    "Origin-Host",
+                    &Value::String(self.my_host.clone()),
+                    &self.avp_map,
+                )
+                .unwrap(),
+                name_value_to_avp(
+                    "Origin-Realm",
+                    &Value::String(self.my_realm.clone()),
+                    &self.avp_map,
+                )
+                .unwrap(),
+                //name_value_to_avp("Origin-State-Id", &Value::Number(1.into()), &self.avp_map).unwrap(),
+            ],
+        );
+        info!(
+            "Sending DWR: {} to sctp server: {}",
+            dwr_command.to_pretty_json_str(&self.command_map, &self.avp_map),
+            self.get_id()
+        );
+        self.send(&dwr_command).await
     }
 
     async fn process_command(&self, command: &mut Command) -> Result<(), String> {
@@ -989,18 +738,6 @@ impl SctpClientConnection {
     }
 }
 
-#[cfg(target_os = "linux")]
-async fn read_exact(stream: &SctpConnectionStream, buffer: &mut [u8]) -> Result<(), String> {
-    let mut offset = 0;
-    while offset < buffer.len() {
-        let read = stream.read(&mut buffer[offset..]).await?;
-        if read == 0 {
-            return Err("SCTP connection closed unexpectedly".to_string());
-        }
-        offset += read;
-    }
-    Ok(())
-}
 
 #[cfg(target_os = "linux")]
 #[async_trait::async_trait]
@@ -1047,6 +784,8 @@ impl Connection for SctpClientConnection {
 
 #[cfg(target_os = "linux")]
 pub struct SctpDiameterServer {
+    stream_id: u16,
+    ppid: u32,
     my_host: String,
     my_realm: String,
     capability: StackCapability,
@@ -1068,6 +807,8 @@ pub struct SctpDiameterServer {
 #[cfg(target_os = "linux")]
 impl SctpDiameterServer {
     pub fn new(
+        stream_id: u16,
+        ppid: u32,
         my_host: String,
         my_realm: String,
         capability: StackCapability,
@@ -1086,6 +827,8 @@ impl SctpDiameterServer {
         redirect_host_manager: Arc<Box<RedirectHostManager>>,
     ) -> Self {
         SctpDiameterServer {
+            stream_id,
+            ppid,
             my_host,
             my_realm,
             capability,
@@ -1149,7 +892,7 @@ impl SctpDiameterServer {
     }
 
     pub async fn start(&self) -> Result<(), String> {
-        let listener = SctpListener::bind(&self.addresses).await?;
+        let listener = SctpListener::bind(self.stream_id, self.ppid, &self.addresses).await?;
         if self.dtls_enabled() {
             info!(
                 "SctpDiameterServer listening on {:?} with DTLS",
@@ -1236,7 +979,8 @@ impl SctpDiameterServer {
         command_map: &CommandMap,
         capability: &StackCapability,
     ) -> Result<Command, String> {
-        let cer = Self::read_command_from_sctp(stream).await?;
+        info!("Waiting for CER from sctp client: {}", peer_address);
+        let cer = read_command_from_sctp(stream).await?;
         info!(
             "Received {} command: {} from sctp client: {}",
             if cer.is_request() {
@@ -1269,18 +1013,6 @@ impl SctpDiameterServer {
         Ok(cer)
     }
 
-    async fn read_command_from_sctp(stream: &Arc<SctpConnectionStream>) -> Result<Command, String> {
-        let mut length_buffer = [0u8; 4];
-        read_exact(stream, &mut length_buffer).await?;
-        let message_length = u32::from_be_bytes(length_buffer) & 0x00FFFFFF;
-        let mut buffer = vec![0u8; message_length as usize - 4];
-        read_exact(stream, &mut buffer).await?;
-        let mut command_buffer = CommandBuffer::from_bytes(&length_buffer);
-        command_buffer.append(&buffer);
-        command_buffer
-            .read_command()
-            .ok_or_else(|| "Failed to parse command from SCTP stream".to_string())
-    }
 
     fn create_cea(
         host: String,
@@ -1291,7 +1023,7 @@ impl SctpDiameterServer {
     ) -> Command {
         let mut cea = Command::new(
             CommandCode::CapabilitiesExchange as u32,
-            CommandFlags::Proxiable as u8,
+            0,
             0,
             cer_command.hop_by_hop_id,
             cer_command.end_to_end_id,
@@ -1330,7 +1062,7 @@ pub struct SctpServerConnection {
 #[cfg(target_os = "linux")]
 impl SctpServerConnection {
     pub fn new(
-        peer_addr: String,
+        peer_addr: String,        
         stream: Arc<SctpConnectionStream>,
         my_host: String,
         my_realm: String,
@@ -1492,7 +1224,7 @@ impl SctpServerConnection {
     async fn process_dwa(&self, command: &Command) -> Result<(), String> {
         let dwa = Command::new(
             CommandCode::DeviceWatchdog as u32,
-            CommandFlags::Proxiable as u8,
+            0,
             0,
             command.hop_by_hop_id,
             command.end_to_end_id,
@@ -1528,7 +1260,7 @@ impl SctpServerConnection {
     async fn process_dpr(&self, command: &Command) -> Result<(), String> {
         let dpr = Command::new(
             CommandCode::DisconnectPeer as u32,
-            CommandFlags::Proxiable as u8,
+            0,
             0,
             command.hop_by_hop_id,
             command.end_to_end_id,

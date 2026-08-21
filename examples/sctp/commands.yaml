@@ -1,0 +1,41 @@
+commands:
+- long-name: "User-Data-Request"
+  short-name: "UDR"
+  code: 306
+  application-id: 16777217
+  request: true
+  proxiable: true
+  error: false
+  retransmit: false
+  avps:
+  - "Session-Id"
+  - "Vendor-Specific-Application-Id"
+  - "Origin-Host"
+  - "Origin-Realm"
+  - "Destination-Host"
+  - "Destination-Realm"
+  - "User-Name"
+  - "Data-Reference"
+  - "Service-Indication"
+  - "Server-Name"
+  - "Wildcarded-Public-Identity"
+  - "MSISDN"
+  - "DSA-Flags"
+  - "Current-Location"
+
+- long-name: "User-Data-Answer"
+  short-name: "UDA"
+  code: 306
+  application-id: 16777217
+  request: false
+  proxiable: true
+  error: false
+  retransmit: false
+  avps:
+  - "Session-Id"
+  - "Vendor-Specific-Application-Id"
+  - "Result-Code"
+  - "Experimental-Result"
+  - "Origin-Host"
+  - "Origin-Realm"
+  - "User-Data"

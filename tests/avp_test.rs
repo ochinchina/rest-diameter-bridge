@@ -10,7 +10,7 @@ fn test_avp_encoding_decoding() {
     let decoded = Avp::decode(&encoded).unwrap();
     assert_eq!(avp.code, decoded.code);
     assert_eq!(avp.flags, decoded.flags);
-    assert_eq!(avp.total_length(), decoded.total_length());
+    assert_eq!(avp.total_length_including_padding(), decoded.total_length_including_padding());
 }
 #[test]
 fn test_avp_to_name_value() {
@@ -59,7 +59,7 @@ fn test_name_value_to_avp() {
     let avp = rest_diameter_bridge::avp::name_value_to_avp(name, &value, &avp_map).unwrap();
     assert_eq!(avp.code, 1);
     assert_eq!(avp.flags, 0x40);
-    assert_eq!(avp.total_length(), 8 + 4);
+    assert_eq!(avp.total_length_including_padding(), 8 + 4);
 }
 
 #[test]
